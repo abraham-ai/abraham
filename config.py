@@ -11,16 +11,17 @@ APP_NAME              = "abraham"
 GENERATION_COUNT      = 16
 MODEL_NAME            = "claude-sonnet-4-20250514"
 FALLBACK_MODEL_NAME   = "gpt-4o"
-MAX_PARALLEL_WORKERS  = 10
+MAX_PARALLEL_WORKERS  = 4
 MAX_CREATION_RETRIES  = 3
 DB                    = os.getenv("DB", "STAGE")
 
 
 # ──────────  TIMING  ──────────
 TIMEZONE              = "America/New_York"
-GENESIS_TIME          = "22:52"          # When to start the daily tournament
-UPDATE_INTERVAL       = 8                # Minutes between update cycles
-DESTROY_INTERVAL      = 20               # Minutes between destroy cycles
+GENESIS_TIME          = "12:30"          # When to start the daily tournament
+UPDATE_INTERVAL       = 10              # Minutes between update cycles
+DESTROY_INTERVAL      = 20             # Minutes between destroy cycles
+CYCLE_CHECK_INTERVAL  = 10              # Minutes between orchestrator checks
 
 # ──────────  CHAIN INFO  ──────────
 PINATA_JWT = os.getenv("PINATA_JWT")

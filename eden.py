@@ -113,13 +113,8 @@ async def generate_creation_ideas() -> CreationDrafts:
     logger.info("Generating new creation ideas...")
     
     if DEBUG:
-        # Return mock creation ideas
-        mock_ideas = [
-            "Mock idea 1",
-            "Mock idea 2",
-            "Mock idea 3",
-            "Mock idea 4"
-        ]
+        # Return mock creation ideas based on GENERATION_COUNT
+        mock_ideas = [f"Mock idea {i+1}" for i in range(GENERATION_COUNT)]
         return CreationDrafts(creations=mock_ideas)
     
     # Prepare system message
@@ -265,6 +260,10 @@ async def validate_creation(session: Any) -> CreationValidation:
     response = await async_prompt(context)
     
     result = CreationValidation(**json.loads(response.content))
+
+    # Use webp thumbnail for validation
+    # if result.result_url and result.result_url.endswith(".png"):
+    #     result.result_url = result.result_url.replace(".png", "_1024.webp")
     
     return result
 
@@ -330,6 +329,11 @@ async def process_blessings_iteration(
         
     # Validate the new creation
     result = await validate_creation(session)
+
+    # Use webp thumbnail for validation
+    # if result.result_url and result.result_url.endswith(".png"):
+    #     result.result_url = result.result_url.replace(".png", "_1024.webp")
+    
     return result, user_message
 
 
