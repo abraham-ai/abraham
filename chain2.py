@@ -46,12 +46,10 @@ def resolve_nonce(w3: Web3, address: str, provided_nonce: Optional[int]) -> int:
     pending_nonce = w3.eth.get_transaction_count(address, "pending")
     if provided_nonce is None:
         return pending_nonce
-    # If caller provided a nonce, ensure it's not behind pending.
-    if provided_nonce < pending_nonce:
-        logger.warning(
-            f"Provided nonce={provided_nonce} is lower than pending={pending_nonce}; "
-            f"using pending."
-        )
+    if provided_nonce > pending_nonce:
+        logger.warning(f"Provided nonce {provided_nonce} > pending {pending_nonce}; tx will queue until gaps fill.")
+    elif provided_nonce < pending_nonce:
+        logger.warning(f"Provided nonce {provided_nonce} < pending {pending_nonce}; using {pending_nonce}.")
         return pending_nonce
     return provided_nonce
 
