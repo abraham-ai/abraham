@@ -68,12 +68,7 @@ def setup_auction(
             token_id = int(current_view[1])
             print("TOKEN ID", token_id)
 
-            """
-            CONTRACT OWNER 0x641f5ffC5F6239A0873Bd00F9975091FB035aAFC
-            GENESIS STARTED True
-            NEXT SEEDED False
-            CURRENT VIEW [1, 0, 1755129520, 1755133120, '0xF7425fB026f9297fCc57B14ace187215442586a2', 1000000000000000, False, True, True, True, False, False, False, 1]
-            """
+        
 
             logger.info(
                 f"owner={contract_owner}, sender={owner_account.address}, genesisStarted={genesis_started}, "
