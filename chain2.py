@@ -271,14 +271,11 @@ def safe_send(
         receipt = wait_for_confirmations(
             w3, tx_hash, confirmations=confirmations, timeout_s=timeout_s, poll_interval=poll_interval
         )
+        
+        eff = receipt.get("effectiveGasPrice")
         logger.info(
-            f"✅ {op_name} confirmed: {tx_hex} | block={receipt.blockNumber} "
-            f"gasUsed={receipt.gasUsed} "
-            + (
-                f"effGasPrice={_fmt_gwei(receipt.effectiveGasPrice)}"
-                if hasattr(receipt, "effectiveGasPrice") and receipt.effectiveGasPrice
-                else ""
-            )
+            f"✅ {op_name} confirmed: {tx_hex} | block={receipt.blockNumber} gasUsed={receipt.gasUsed}"
+            + (f" effGasPrice={_fmt_gwei(eff)}" if eff is not None else "")
         )
 
         return tx_hash, receipt
