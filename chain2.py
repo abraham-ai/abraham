@@ -5,7 +5,7 @@ from typing import Optional, Tuple, Dict, Any
 from web3 import Web3
 from web3.exceptions import ContractLogicError, TimeExhausted
 from eth_account import Account
-
+from eth_utils import to_text
 
 import ipfs
 
@@ -93,6 +93,18 @@ def suggest_fees(
 
     return {"maxFeePerGas": max_fee, "maxPriorityFeePerGas": prio}
 
+def _extract_revert_msg(err_dict: Dict[str, Any]) -> str:
+    data = err_dict.get("data")
+    if isinstance(data, str) and data.startswith("0x08c379a0"):  # Error(string)
+        # Skip selector + offset boilerplate to get the string; or use eth_abi:
+        try:
+            # 4 bytes selector + 32 offset + 32 len = 68 bytes header
+            msg_len = int(data[136:136+64], 16)
+            raw = bytes.fromhex(data[200:200+msg_len*2])
+            return to_text(raw)
+        except Exception:
+            pass
+    return err_dict.get("message", "execution reverted")
 
 def simulate_call(
     contract_function,
@@ -109,8 +121,7 @@ def simulate_call(
         # Most useful error for devs
         raise BlockchainError(f"Simulation reverted: {e}") from e
     except ValueError as e:
-        # JSON-RPC error shape commonly in e.args[0]
-        msg = e.args[0].get("message") if e.args and isinstance(e.args[0], dict) else str(e)
+        msg = _extract_revert_msg(e.args[0]) if e.args and isinstance(e.args[0], dict) else str(e)
         raise BlockchainError(f"Simulation failed: {msg}") from e
     except Exception as e:
         raise BlockchainError(f"Simulation failed: {e}") from e
