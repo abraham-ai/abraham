@@ -116,21 +116,12 @@ def simulate_call(
         raise BlockchainError(f"Simulation failed: {e}") from e
 
 
-def estimate_gas(
-    contract_function,
-    from_address: str,
-    nonce: int,
-    value: int = 0,
-    gas_limit_cap: int = 1_200_000,
-) -> int:
-    """
-    Try to get an accurate estimate. Add a small buffer and cap. If estimate fails,
-    let caller decide a default fallback.
-    """
-    est = contract_function.estimate_gas({"from": from_address, "nonce": nonce, "value": value})
-    gas_limit = int(est * 1.20)  # 20% buffer
-    gas_limit = min(gas_limit, gas_limit_cap)
-    return gas_limit
+def estimate_gas(contract_function, from_address, nonce, value=0, gas_limit_cap=1_200_000, fee_params=None):
+    params = {"from": from_address, "nonce": nonce, "value": value}
+    if fee_params and {"maxFeePerGas","maxPriorityFeePerGas"} <= fee_params.keys():
+        params |= {"maxFeePerGas": fee_params["maxFeePerGas"], "maxPriorityFeePerGas": fee_params["maxPriorityFeePerGas"]}
+    est = contract_function.estimate_gas(params)
+    return min(int(est * 1.20), gas_limit_cap)
 
 
 def wait_for_confirmations(w3, tx_hash, confirmations=3, inclusion_timeout_s=120, conf_timeout_s=180, poll_interval=1.0):
