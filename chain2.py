@@ -167,15 +167,15 @@ def safe_send(
 
     # ---- 2) nonce + gas + fees
     use_nonce = resolve_nonce(w3, addr, nonce)
+    fee_params = suggest_fees(w3, urgency=urgency)
+
     try:
         gas_limit = estimate_gas(
-            contract_function, addr, use_nonce, value=value, gas_limit_cap=gas_limit_cap
+            contract_function, addr, use_nonce, value=value, gas_limit_cap=gas_limit_cap, fee_params=fee_params
         )
     except Exception as e:
         logger.warning(f"{op_name}: gas estimate failed: {e}; using default={default_gas_limit}")
         gas_limit = default_gas_limit
-
-    fee_params = suggest_fees(w3, urgency=urgency)
     
     # Guard against RPC oddities: ensure maxFeePerGas >= maxPriorityFeePerGas
     if "maxFeePerGas" in fee_params and "maxPriorityFeePerGas" in fee_params:
