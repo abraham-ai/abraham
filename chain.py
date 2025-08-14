@@ -3,25 +3,23 @@ import time
 import random
 import modal
 import requests
+from datetime import datetime, timezone
 from web3 import Web3
 from eth_account import Account
-from typing import Any, Dict, List, Tuple, Optional, Union
+from typing import Any, Dict, List, Tuple, Optional
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from config import (
     logger, 
-    IPFS_PREFIX, 
-    IPFS_BASE_URL, 
-    PINATA_JWT,
     BASE_SEPOLIA_RPC,
     PRIVATE_KEY,
-    CONTRACT_ADDRESS,
-    CONTRACT_ABI,
+    CONTRACT_ADDRESS_TOURNAMENT,
+    CONTRACT_ABI_TOURNAMENT,
     CHAIN_ID,
     GAS_LIMIT_CREATE_SESSION,
     GAS_LIMIT_UPDATE_SESSION,
     SUBGRAPH_URL,
-    ABRAHAM_ADDRESS
+    ABRAHAM_ADDRESS,
 )
 
 nonce_dict = modal.Dict.from_name("nonce_dict", create_if_missing=True)
@@ -177,7 +175,7 @@ def send_blockchain_transaction(
             "from": owner_account.address,
             "nonce": nonce,
             "gas": gas_limit,
-            "gasPrice": gas_price,
+            "gasPrice": gas_price
         })
         
         signed_tx = w3.eth.account.sign_transaction(tx_data, private_key=PRIVATE_KEY)
@@ -213,58 +211,56 @@ def send_blockchain_transaction(
 
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=8),
-    retry=retry_if_exception_type((BlockchainError, requests.RequestException)),
-    before_sleep=lambda retry_state: logger.info(f"Retrying IPFS upload (attempt {retry_state.attempt_number}/3)...")
+    wait=wait_exponential(multiplier=1, min=4, max=10), 
+    retry=retry_if_exception_type(BlockchainError),
+    before_sleep=lambda retry_state: logger.info(f"Retrying get_contract_data (attempt {retry_state.attempt_number}/3)...")
 )
-def upload_to_ipfs(data: str) -> str:
-    """Upload data to Pinata and return IPFS URL with retry logic."""
+def get_contract_data(
+    session_ids: Optional[List[str]] = None, 
+    date_filter: Optional[datetime] = None,
+    closed_filter: Optional[bool] = None
+) -> Dict[str, Any]:
+    """Get contract data from subgraph, optionally filtered by session IDs, date, and closed status.
+    
+    Args:
+        session_ids: Optional list of session IDs to filter by
+        date_filter: Optional datetime object to filter by date (sessions from that day)
+        closed_filter: Optional boolean to filter by closed status (True=closed, False=open)
+    """
     try:
-        if not PINATA_JWT:
-            raise BlockchainError("PINATA_JWT not configured")
-            
-        headers = {"Authorization": f"Bearer {PINATA_JWT}"}
-        url = f"{IPFS_BASE_URL}/pinning/pinFileToIPFS"
+        # Handle date filtering
+        date_where_clause = ""
+        if date_filter:            
+            start_timestamp = int(datetime(date_filter.year, date_filter.month, date_filter.day).timestamp())
+            end_timestamp = start_timestamp + 86400  # Add 24 hours            
+            date_where_clause = f"firstMessageAt_gte: {start_timestamp}, firstMessageAt_lt: {end_timestamp}"
 
-        # Download and upload file
-        if isinstance(data, str) and data.startswith(('http://', 'https://')):
-            response = requests.get(data, timeout=60)
-            if response.status_code != 200:
-                raise BlockchainError(f"Failed to download file: {response.status_code}")
-            files = {"file": ("file", response.content)}
-        else:
-            raise ValueError("Data must be a URL")
+        # Handle closed filtering
+        closed_where_clause = ""
+        if closed_filter is not None:
+            closed_where_clause = f"closed: {str(closed_filter).lower()}"
 
-        logger.info("Uploading to IPFS...")
-        response = requests.post(url, files=files, headers=headers, timeout=60)
-        if response.status_code != 200:
-            raise BlockchainError(f"IPFS upload failed: {response.status_code}")
+        # Build where clause by combining all filters
+        where_conditions = []
+        if session_ids is not None:
+            where_conditions.append("id_in: $ids")
+        if date_where_clause:
+            where_conditions.append(date_where_clause)
+        if closed_where_clause:
+            where_conditions.append(closed_where_clause)
         
-        ipfs_hash = response.json()["IpfsHash"]
-        logger.info(f"Uploaded to IPFS: {ipfs_hash}")
-        return f"{IPFS_PREFIX}{ipfs_hash}"
-        
-    except requests.RequestException as e:
-        raise BlockchainError(f"Network error during IPFS upload: {e}")
-    except Exception as e:
-        raise BlockchainError(f"IPFS upload error: {e}")
-
-
-def get_contract_data(session_ids: List[str] = None) -> Dict[str, Any]:
-    """Get contract data from subgraph, optionally filtered by session IDs."""
-    try:
-        if not SUBGRAPH_URL:
-            raise BlockchainError("SUBGRAPH_URL not configured")
-
-        # Build query based on whether we're filtering by IDs
-        if session_ids is None:
-            var_decl = ""
-            where_arg = ""
-            variables = {"firstCreations": 500, "firstMsgs": 200}
-        else:
+        # Build query variables and where clause
+        if session_ids is not None:
             var_decl = "$ids: [ID!], "
-            where_arg = "where: { id_in: $ids }"
             variables = {"firstCreations": 500, "firstMsgs": 200, "ids": session_ids}
+        else:
+            var_decl = ""
+            variables = {"firstCreations": 500, "firstMsgs": 200}
+        
+        if where_conditions:
+            where_arg = f"where: {{ {', '.join(where_conditions)} }}"
+        else:
+            where_arg = ""
 
         query = f'''
         query Timeline({var_decl}$firstCreations: Int!, $firstMsgs: Int!) {{
@@ -295,8 +291,8 @@ def get_contract_data(session_ids: List[str] = None) -> Dict[str, Any]:
 
         response = requests.post(
             SUBGRAPH_URL,
-            json={"query": query, "variables": variables},
-            timeout=60,
+            json={"query": query, "variables": variables},  
+            timeout=60
         )
         
         if response.status_code != 200:
@@ -310,8 +306,8 @@ def get_contract_data(session_ids: List[str] = None) -> Dict[str, Any]:
             c["id"]: {
                 "messages": c["messages"],
                 "closed": c["closed"],
-                "firstMessageAt": c["firstMessageAt"],
-                "lastActivityAt": c["lastActivityAt"],
+                "firstMessageAt": c["firstMessageAt"], 
+                "lastActivityAt": c["lastActivityAt"]
             }
             for c in data["data"]["creations"]
         }
@@ -325,14 +321,89 @@ def get_contract_data(session_ids: List[str] = None) -> Dict[str, Any]:
         return creations
         
     except requests.RequestException as e:
+        logger.error(f"Network error accessing subgraph: {e}")
         raise BlockchainError(f"Network error accessing subgraph: {e}")
     except Exception as e:
+        logger.error(f"Error retrieving contract data: {e}")
         raise BlockchainError(f"Error retrieving contract data: {e}")
 
 
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
+    wait=wait_exponential(multiplier=1, min=4, max=10), 
+    retry=retry_if_exception_type(BlockchainError),
+    before_sleep=lambda retry_state: logger.info(f"Retrying create_session_on_chain (attempt {retry_state.attempt_number}/3)...")
+)
+def create_batch_sessions_on_chain(
+    sessions: List[Dict],
+    nonce: Optional[int] = None
+) -> Any:
+    """Create session on blockchain with retry logic and validation."""
+    try:
+        session_ids = ", ".join([session["session_id"][:8] for session in sessions])
+        logger.info(f"Creating session on chain: {session_ids}...")
+
+        # Setup Web3 and contract
+        if not all([BASE_SEPOLIA_RPC, PRIVATE_KEY, CONTRACT_ADDRESS_TOURNAMENT, CONTRACT_ABI_TOURNAMENT]):
+            raise BlockchainError("Missing blockchain configuration")
+
+        with open(CONTRACT_ABI_TOURNAMENT, "r") as f:
+            contract_abi = json.load(f)
+
+        w3 = Web3(Web3.HTTPProvider(BASE_SEPOLIA_RPC))
+        if not w3.is_connected():
+            raise BlockchainError("Web3 connection failed")
+
+        owner_account = Account.from_key(PRIVATE_KEY)
+        contract = w3.eth.contract(address=CONTRACT_ADDRESS_TOURNAMENT, abi=contract_abi)
+        
+        # Handle nonce - validate if provided, get fresh if needed
+        if nonce is None:
+            nonce = get_next_nonce(w3, owner_account.address)
+        else:
+            current_nonce = w3.eth.get_transaction_count(owner_account.address, 'pending')
+            if nonce < current_nonce:
+                logger.warning(f"Nonce {nonce} stale (current: {current_nonce}), getting fresh nonce")
+                nonce = get_next_nonce(w3, owner_account.address)
+        
+        session_data = [
+            {
+                "sessionId": session['session_id'],
+                "firstMessageId": str(session['session'].messages[-1]), 
+                "content": session['announcement'],
+                "media": session['ipfs_url']
+            }
+            for session in sessions
+        ]
+
+        # Debug logging to see what we're sending to the contract
+        logger.info(f"Session data for contract (first 2): {session_data[:2]}")
+        logger.info(f"Total sessions to create: {len(session_data)}")
+
+        # Build contract function call
+        contract_function = contract.functions.abrahamBatchCreate(
+            session_data
+        )
+        
+        # Send transaction using common logic
+        tx_hash, receipt = send_blockchain_transaction(
+            w3, contract_function, owner_account, nonce, 
+            GAS_LIMIT_CREATE_SESSION, "CREATE_SESSION"
+        )
+        
+        logger.info(f"✅ Session created: {session_ids}...")
+        return receipt
+        
+    except Exception as e:
+        logger.error("=== the session data ===")
+        logger.error(json.dumps(session_data, indent=4))
+
+        raise BlockchainError(f"Failed to create sessions on chain: {e}")
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10), 
     retry=retry_if_exception_type(BlockchainError),
     before_sleep=lambda retry_state: logger.info(f"Retrying create_session_on_chain (attempt {retry_state.attempt_number}/3)...")
 )
@@ -341,17 +412,17 @@ def create_session_on_chain(
     message_id: str, 
     content: str,
     ipfs_url: str,
-    nonce: Optional[int] = None,
+    nonce: Optional[int] = None
 ) -> Any:
     """Create session on blockchain with retry logic and validation."""
     try:
         logger.info(f"Creating session on chain: {session_id[:8]}...")
 
         # Setup Web3 and contract
-        if not all([BASE_SEPOLIA_RPC, PRIVATE_KEY, CONTRACT_ADDRESS, CONTRACT_ABI]):
+        if not all([BASE_SEPOLIA_RPC, PRIVATE_KEY, CONTRACT_ADDRESS_TOURNAMENT, CONTRACT_ABI_TOURNAMENT]):
             raise BlockchainError("Missing blockchain configuration")
 
-        with open(CONTRACT_ABI, "r") as f:
+        with open(CONTRACT_ABI_TOURNAMENT, "r") as f:
             contract_abi = json.load(f)
 
         w3 = Web3(Web3.HTTPProvider(BASE_SEPOLIA_RPC))
@@ -359,7 +430,7 @@ def create_session_on_chain(
             raise BlockchainError("Web3 connection failed")
 
         owner_account = Account.from_key(PRIVATE_KEY)
-        contract = w3.eth.contract(address=CONTRACT_ADDRESS, abi=contract_abi)
+        contract = w3.eth.contract(address=CONTRACT_ADDRESS_TOURNAMENT, abi=contract_abi)
         
         # Handle nonce - validate if provided, get fresh if needed
         if nonce is None:
@@ -373,7 +444,7 @@ def create_session_on_chain(
         # Build contract function call
         contract_function = contract.functions.createSession(
             sessionId=str(session_id),
-            firstMessageId=str(message_id),
+            firstMessageId=str(message_id), 
             content=content,
             media=str(ipfs_url)
         )
@@ -388,7 +459,73 @@ def create_session_on_chain(
         return receipt
         
     except Exception as e:
+        logger.error(f"Failed to create session on chain: {e}")
         raise BlockchainError(f"Failed to create session on chain: {e}")
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type(BlockchainError),
+    before_sleep=lambda retry_state: logger.info(f"Retrying update_session_on_chain (attempt {retry_state.attempt_number}/3)...")
+)
+def update_sessions_on_chain(
+    sessions: List[Any],
+) -> Tuple[Any, Any]:
+    """Update session on blockchain with retry logic and validation."""
+    try:
+        logger.info(f"Updating sessions on chain: {len(sessions)}...")
+        
+        # Setup Web3 and contract
+        if not all([BASE_SEPOLIA_RPC, PRIVATE_KEY, CONTRACT_ADDRESS_TOURNAMENT, CONTRACT_ABI_TOURNAMENT]):
+            raise BlockchainError("Missing blockchain configuration")
+        
+        with open(CONTRACT_ABI_TOURNAMENT, "r") as f:
+            contract_abi = json.load(f)
+        
+        w3 = Web3(Web3.HTTPProvider(BASE_SEPOLIA_RPC))
+        if not w3.is_connected():
+            raise BlockchainError("Web3 connection failed")
+
+        owner_account = Account.from_key(PRIVATE_KEY)
+        contract = w3.eth.contract(address=CONTRACT_ADDRESS_TOURNAMENT, abi=contract_abi)
+
+        # Handle nonce - validate if provided, get fresh if needed
+        if nonce is None:
+            nonce = get_next_nonce(w3, owner_account.address)
+        else:
+            current_nonce = w3.eth.get_transaction_count(owner_account.address, 'pending')
+            if nonce < current_nonce:
+                logger.warning(f"Nonce {nonce} stale (current: {current_nonce}), getting fresh nonce")
+                nonce = get_next_nonce(w3, owner_account.address)
+
+        session_data = [
+            {
+                "sessionId": session["session_id"],
+                "messageId": session["message_id"],
+                "content": session["content"],
+                "media": session["ipfs_url"],
+                "closed": session["closed"]
+            }
+            for session in sessions
+        ]
+
+        # Build contract function call
+        contract_function = contract.functions.abrahamBatchUpdateAcrossSessions(session_data)
+        
+        # Send transaction using common logic
+        tx_hash, receipt = send_blockchain_transaction(
+            w3, contract_function, owner_account, nonce, 
+            GAS_LIMIT_UPDATE_SESSION, "UPDATE_SESSION"
+        )
+
+        logger.info(f"✅ Sessions updated on chain: {len(sessions)}...")
+        return tx_hash, receipt
+        
+    except Exception as e:
+        logger.error(f"Failed to update sessions on chain: {e}")
+        raise BlockchainError(f"Failed to update sessions on chain: {e}")
+
 
 
 @retry(
@@ -403,17 +540,17 @@ def update_session_on_chain(
     ipfs_url: str, 
     content: str, 
     closed: bool = False,
-    nonce: Optional[int] = None,
+    nonce: Optional[int] = None
 ) -> Tuple[Any, Any]:
     """Update session on blockchain with retry logic and validation."""
-    try:        
+    try:
         logger.info(f"Updating session on chain: {session_id[:8]}... (closed: {closed})")
         
         # Setup Web3 and contract
-        if not all([BASE_SEPOLIA_RPC, PRIVATE_KEY, CONTRACT_ADDRESS, CONTRACT_ABI]):
+        if not all([BASE_SEPOLIA_RPC, PRIVATE_KEY, CONTRACT_ADDRESS_TOURNAMENT, CONTRACT_ABI_TOURNAMENT]):
             raise BlockchainError("Missing blockchain configuration")
         
-        with open(CONTRACT_ABI, "r") as f:
+        with open(CONTRACT_ABI_TOURNAMENT, "r") as f:
             contract_abi = json.load(f)
         
         w3 = Web3(Web3.HTTPProvider(BASE_SEPOLIA_RPC))
@@ -421,7 +558,7 @@ def update_session_on_chain(
             raise BlockchainError("Web3 connection failed")
 
         owner_account = Account.from_key(PRIVATE_KEY)
-        contract = w3.eth.contract(address=CONTRACT_ADDRESS, abi=contract_abi)
+        contract = w3.eth.contract(address=CONTRACT_ADDRESS_TOURNAMENT, abi=contract_abi)
 
         # Handle nonce - validate if provided, get fresh if needed
         if nonce is None:
@@ -441,10 +578,10 @@ def update_session_on_chain(
 
         # Build contract function call
         contract_function = contract.functions.abrahamUpdate(
-            str(session_id),
-            str(message_id),
-            content,
-            ipfs_url,
+            str(session_id), 
+            str(message_id), 
+            content, 
+            ipfs_url, 
             closed
         )
         
@@ -469,7 +606,7 @@ async def get_new_blessings(
     logger.debug(f"Fetching blessings for session {session_id}")
     
     try:
-        session_data = get_contract_data([session_id])
+        session_data = get_contract_data(session_ids=[session_id])
         messages = session_data[session_id]["messages"]
         
         if not messages:
@@ -536,8 +673,8 @@ def cancel_pending_transactions() -> int:
             try:
                 # Self-transfer with 0 value to cancel
                 cancel_tx = {
-                    'nonce': nonce,
-                    'to': owner_account.address,
+                    'nonce': nonce, 
+                    'to': owner_account.address, 
                     'value': 0,
                     'gas': 21000,
                     'gasPrice': replacement_gas_price,

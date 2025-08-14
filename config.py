@@ -18,10 +18,10 @@ DB                    = os.getenv("DB", "STAGE")
 
 # ──────────  TIMING  ──────────
 TIMEZONE              = "America/New_York"
-GENESIS_TIME          = "12:30"          # When to start the daily tournament
+GENESIS_TIME          = "13:45"          # When to start the daily tournament
 UPDATE_INTERVAL       = 10              # Minutes between update cycles
-DESTROY_INTERVAL      = 20             # Minutes between destroy cycles
-CYCLE_CHECK_INTERVAL  = 10              # Minutes between orchestrator checks
+DESTROY_N_UPDATES     = 3               # Run destroy every N update cycles
+# CYCLE_CHECK_INTERVAL  = 15              # Minutes between orchestrator checks
 
 # ──────────  CHAIN INFO  ──────────
 PINATA_JWT = os.getenv("PINATA_JWT")
@@ -29,8 +29,10 @@ IPFS_BASE_URL = os.getenv("IPFS_BASE_URL")
 IPFS_PREFIX = os.getenv("IPFS_PREFIX")
 BASE_SEPOLIA_RPC = os.getenv("BASE_SEPOLIA_RPC")
 PRIVATE_KEY = os.getenv("ABRAHAM_PRIVATE_KEY")
-CONTRACT_ADDRESS = os.getenv("CONTRACT_ADDRESS")
-CONTRACT_ABI = os.getenv("CONTRACT_ABI")
+CONTRACT_ADDRESS_TOURNAMENT = os.getenv("CONTRACT_ADDRESS_TOURNAMENT")
+CONTRACT_ADDRESS_AUCTION = os.getenv("CONTRACT_ADDRESS_AUCTION")
+CONTRACT_ABI_TOURNAMENT = os.getenv("CONTRACT_ABI_TOURNAMENT")
+CONTRACT_ABI_AUCTION = os.getenv("CONTRACT_ABI_AUCTION")
 CHAIN_ID = int(os.getenv("CHAIN_ID"))
 SUBGRAPH_URL = os.getenv("SUBGRAPH_URL")
 ABRAHAM_ADDRESS = os.getenv("ABRAHAM_ADDRESS")
@@ -63,9 +65,6 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%H:%M:%S',
-    handlers=[
-        logging.StreamHandler(),  # Console output
-    ]
 )
 logger = logging.getLogger("abraham")
 logger.setLevel(logging.INFO)
@@ -74,7 +73,7 @@ logger.setLevel(logging.INFO)
 abraham_handler = logging.StreamHandler()
 abraham_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
 abraham_handler.setFormatter(abraham_formatter)
-logger.handlers = [abraham_handler]  # Replace any existing handlers
+#logger.handlers = [abraham_handler]  # Replace any existing handlers
 
 # Suppress dependency logs
 logging.getLogger("httpx").setLevel(logging.WARNING)

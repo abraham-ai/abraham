@@ -4,12 +4,14 @@ load_dotenv()
 import json
 import uuid
 import pytz
+import requests
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from bson import ObjectId
 from fastapi import BackgroundTasks
 from jinja2 import Template
 from pydantic import BaseModel, Field
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from eve.api.api_requests import PromptSessionRequest, SessionCreationArgs
 from eve.api.handlers import setup_session
@@ -29,9 +31,11 @@ from config import (
     DEBUG,
     MODEL_NAME,
     GENERATION_COUNT,
-    USER_ID,
+    USER_ID
 )
 
+# Load Abraham agent
+abraham = Agent.load("abraham")
 
 
 # Prompts
@@ -103,13 +107,34 @@ def get_date_prefix() -> str:
     return datetime.now(pytz.utc).strftime("%m/%d")
 
 
-# Load Abraham agent
-abraham = Agent.load("abraham")
+def url_exists(url: str, timeout: int = 5) -> bool:
+    """Check if a URL exists by making a HEAD request."""
+    try:
+        response = requests.head(url, timeout=timeout, allow_redirects=True)
+        return response.status_code == 200
+    except (requests.RequestException, requests.Timeout):
+        return False
 
 
-# Core functions
+def get_optimal_image_url(original_url: str) -> str:
+    """Get the optimal image URL, preferring webp if available, falling back to original."""
+    if not original_url or not original_url.endswith(".png"):
+        return original_url    
+    webp_url = original_url.replace(".png", "_1024.webp")
+    # Check if webp version exists
+    if url_exists(webp_url):
+        return webp_url    
+    # Fall back to original PNG
+    return original_url
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    before_sleep=lambda retry_state: logger.info(f"Retrying generate_creation_ideas (attempt {retry_state.attempt_number}/3)...")
+)
 async def generate_creation_ideas() -> CreationDrafts:
-    """Generate new creation ideas using LLM."""
+    """Generate new creation ideas on Eden."""
     logger.info("Generating new creation ideas...")
     
     if DEBUG:
@@ -138,7 +163,7 @@ async def generate_creation_ideas() -> CreationDrafts:
         config=LLMConfig(
             model=MODEL_NAME,
             response_format=CreationDrafts
-        ),
+        )
     )
     
     # Generate creation ideas
@@ -148,7 +173,11 @@ async def generate_creation_ideas() -> CreationDrafts:
     return genesis
 
 
-
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    before_sleep=lambda retry_state: logger.info(f"Retrying create_session (attempt {retry_state.attempt_number}/3)...")
+)
 async def create_session(
     creation_prompt: str, 
     model_name: str
@@ -159,8 +188,8 @@ async def create_session(
         # Return mock session
         logger.info(f"[DEBUG] Creating mock session for: {creation_prompt[:50]}...")
         return Session(
-            id=ObjectId(),
-            owner=ObjectId(USER_ID),
+            id=ObjectId(), 
+            owner=ObjectId(USER_ID), 
             messages=[ObjectId(), ObjectId()]
         )
         
@@ -169,7 +198,7 @@ async def create_session(
     # Create session request
     request = PromptSessionRequest(
         user_id=USER_ID,
-        creation_args=SessionCreationArgs(
+            creation_args=SessionCreationArgs(
             owner_id=USER_ID,
             agents=[str(abraham.id)],
             title=f"{get_date_prefix()} :: Creation"
@@ -207,8 +236,8 @@ async def create_session(
         session, 
         abraham, 
         context, 
-        trace_id=str(uuid.uuid4()),
-        user_message=user_message,
+        trace_id=str(uuid.uuid4()), 
+        user_message=user_message
     )
     
     # Execute the prompt session
@@ -219,6 +248,11 @@ async def create_session(
 
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    before_sleep=lambda retry_state: logger.info(f"Retrying validate_creation (attempt {retry_state.attempt_number}/3)...")
+)
 async def validate_creation(session: Any) -> CreationValidation:
     """Validate if the creation was successful and extract results."""
     
@@ -253,7 +287,7 @@ async def validate_creation(session: Any) -> CreationValidation:
         config=LLMConfig(
             model=MODEL_NAME,
             response_format=CreationValidation
-        ),
+        )
     )
     
     # Get validation result
@@ -261,14 +295,19 @@ async def validate_creation(session: Any) -> CreationValidation:
     
     result = CreationValidation(**json.loads(response.content))
 
-    # Use webp thumbnail for validation
-    # if result.result_url and result.result_url.endswith(".png"):
-    #     result.result_url = result.result_url.replace(".png", "_1024.webp")
+    # Use optimal image URL (webp if available, fallback to png)
+    if result.result_url:
+        result.result_url = get_optimal_image_url(result.result_url)
     
     return result
 
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    before_sleep=lambda retry_state: logger.info(f"Retrying process_blessings_iteration (attempt {retry_state.attempt_number}/3)...")
+)
 async def process_blessings_iteration(
     session_id: str, 
     new_blessings: List[dict]
@@ -280,7 +319,7 @@ async def process_blessings_iteration(
         # Return mock blessing result with unique message ID
         logger.info(f"[DEBUG] Mock blessing iteration for session {session_id}")
         result = CreationValidation(
-            result_url="https://edenartlab-stage-data.s3.amazonaws.com/61ccedc87dd9689b2714daebbd851a37b6f74cd5dc3a16dc0b8267a8b535db04.jpg",
+            result_url="https://edenartlab-stage-data.s3.amazonaws.com/61ccedc87dd9689b2714daebbd851a37b6f74cd5dc3a16dc0b8267a8b535db04.jpg", 
             announcement="This is a test blessing response. Abraham created a new artwork inspired by the community's feedback.",
             error=None
         )
@@ -320,7 +359,7 @@ async def process_blessings_iteration(
         abraham, 
         context, 
         trace_id=str(uuid.uuid4()),
-        user_message=user_message,
+        user_message=user_message
     )
     
     # Execute the prompt session
@@ -330,18 +369,23 @@ async def process_blessings_iteration(
     # Validate the new creation
     result = await validate_creation(session)
 
-    # Use webp thumbnail for validation
-    # if result.result_url and result.result_url.endswith(".png"):
-    #     result.result_url = result.result_url.replace(".png", "_1024.webp")
+    # Use optimal image URL (webp if available, fallback to png)
+    if result.result_url:
+        result.result_url = get_optimal_image_url(result.result_url)
     
     return result, user_message
 
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    before_sleep=lambda retry_state: logger.info(f"Retrying close_session (attempt {retry_state.attempt_number}/3)...")
+)
 async def close_session(
     session_id: str, 
     total_praises: int,
-    total_blessings: int,
+    total_blessings: int
 ) -> Tuple[CreationValidation, Any, str]:
     """Process one iteration of blessings and create new artwork."""
     logger.info(f"💭 Adding concluding remark for {session_id}...")
@@ -350,7 +394,7 @@ async def close_session(
         # Return mock blessing result with unique message ID
         logger.info(f"[DEBUG] Mock closing for session {session_id}")
         message = ChatMessage(
-            id=ObjectId(),
+            id=ObjectId(), 
             role="assistant", 
             content=f"Thank you for joining me on this creative journey. With {total_praises} praises and {total_blessings} blessings, we explored new artistic territories together. Until we meet again in the realm of imagination."
         )
@@ -382,7 +426,7 @@ async def close_session(
         abraham, 
         context, 
         trace_id=str(uuid.uuid4()),
-        user_message=user_message,
+        user_message=user_message
     )
     
     # Execute the prompt session
