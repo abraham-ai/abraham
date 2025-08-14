@@ -391,25 +391,16 @@ def main():
 
     contract = w3.eth.contract(address=CONTRACT_ADDRESS_AUCTION, abi=contract_abi)
 
-    # # Get the creation
-    # ipfs_hash = get_creation()
-
-    # # Your test function call
-    # contract_function = contract.functions.setTokenURI(
-    #     0,
-    #     f"ipfs://{ipfs_hash}"
-    # )
-
-
     # Get the creation
     ipfs_hash = get_creation()
 
     # Your test function call
-    # contract_function = contract.functions.startGenesisAuction()
     contract_function = contract.functions.setTokenURI(
-        1,
+        0,
         f"ipfs://{ipfs_hash}"
     )
+
+    # contract_function = contract.functions.startGenesisAuction()
 
     # Send with slightly aggressive fees and 3 confirmations
     try:
