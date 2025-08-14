@@ -135,45 +135,16 @@ def estimate_gas(
     return gas_limit
 
 
-def wait_for_confirmations(
-    w3: Web3,
-    tx_hash: bytes,
-    confirmations: int = 3,
-    timeout_s: int = 180,
-    poll_interval: float = 1.0,
-):
-    """
-    Wait for inclusion, verify success, then wait N block confirmations.
-    """
-    start = time.time()
-    tx_hex = tx_hash.hex()
-    logger.info(f"Waiting for inclusion: {tx_hex} (timeout={timeout_s}s)")
-    try:
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout_s)
-    except TimeExhausted as e:
-        raise BlockchainError(f"Transaction not mined within {timeout_s}s: {tx_hex}") from e
-
+def wait_for_confirmations(w3, tx_hash, confirmations=3, inclusion_timeout_s=120, conf_timeout_s=180, poll_interval=1.0):
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=inclusion_timeout_s)
     if receipt.status != 1:
-        raise BlockchainError(
-            f"Transaction reverted in block {receipt.blockNumber}: {tx_hex}"
-        )
-
-    # Wait for N confirmations
+        raise BlockchainError(f"Transaction reverted in block {receipt.blockNumber}: {tx_hash.hex()}")
     target = receipt.blockNumber + confirmations
-    logger.info(
-        f"Included in block {receipt.blockNumber}, waiting for {confirmations} confirmations "
-        f"(→ ≥{target})."
-    )
-    while True:
-        if time.time() - start > timeout_s:
-            raise BlockchainError(
-                f"Timed out while waiting for {confirmations} confirmations: {tx_hex}"
-            )
-        head = w3.eth.block_number
-        if head >= target:
-            break
+    t0 = time.time()
+    while w3.eth.block_number < target:
+        if time.time() - t0 > conf_timeout_s:
+            raise BlockchainError(f"Timed out waiting for {confirmations} confirmations: {tx_hash.hex()}")
         time.sleep(poll_interval)
-
     return receipt
 
 
@@ -269,9 +240,9 @@ def safe_send(
     # ---- 4) wait for confirmations, possibly speed up if stuck
     try:
         receipt = wait_for_confirmations(
-            w3, tx_hash, confirmations=confirmations, timeout_s=timeout_s, poll_interval=poll_interval
+            w3=w3, tx_hash=tx_hash, confirmations=confirmations, conf_timeout_s=timeout_s, inclusion_timeout_s=timeout_s, poll_interval=poll_interval
         )
-        
+
         eff = receipt.get("effectiveGasPrice")
         logger.info(
             f"✅ {op_name} confirmed: {tx_hex} | block={receipt.blockNumber} gasUsed={receipt.gasUsed}"
@@ -311,10 +282,11 @@ def safe_send(
                     f"↻ Speed-up attempt {attempts}: {_fmt_gwei(bump_fees.get('maxFeePerGas', bump_fees.get('gasPrice', 0)))} → {tx_hex}  {_explorer_url(tx_hex)}"
                 )
                 receipt = wait_for_confirmations(
-                    w3,
-                    tx_hash,
+                    w3=w3,
+                    tx_hash=tx_hash,
                     confirmations=confirmations,
-                    timeout_s=timeout_s,
+                    conf_timeout_s=timeout_s,
+                    inclusion_timeout_s=timeout_s,
                     poll_interval=poll_interval,
                 )
                 logger.info(
