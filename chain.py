@@ -1,18 +1,21 @@
 import json
-import asyncio
 import time
 from typing import Optional, Tuple, Dict, Any
 
 from web3 import Web3
 from web3.exceptions import ContractLogicError, TimeExhausted
 from eth_account import Account
+from eth_utils import to_text
 
+import ipfs
 
 from config import (
     logger,
     BASE_SEPOLIA_RPC,
     PRIVATE_KEY,
     CHAIN_ID,
+    CONTRACT_ADDRESS_AUCTION,
+    CONTRACT_ABI_AUCTION,
 )
 
 # ---------- Errors ----------
@@ -43,12 +46,10 @@ def resolve_nonce(w3: Web3, address: str, provided_nonce: Optional[int]) -> int:
     pending_nonce = w3.eth.get_transaction_count(address, "pending")
     if provided_nonce is None:
         return pending_nonce
-    # If caller provided a nonce, ensure it's not behind pending.
-    if provided_nonce < pending_nonce:
-        logger.warning(
-            f"Provided nonce={provided_nonce} is lower than pending={pending_nonce}; "
-            f"using pending."
-        )
+    if provided_nonce > pending_nonce:
+        logger.warning(f"Provided nonce {provided_nonce} > pending {pending_nonce}; tx will queue until gaps fill.")
+    elif provided_nonce < pending_nonce:
+        logger.warning(f"Provided nonce {provided_nonce} < pending {pending_nonce}; using {pending_nonce}.")
         return pending_nonce
     return provided_nonce
 
@@ -92,6 +93,18 @@ def suggest_fees(
 
     return {"maxFeePerGas": max_fee, "maxPriorityFeePerGas": prio}
 
+def _extract_revert_msg(err_dict: Dict[str, Any]) -> str:
+    data = err_dict.get("data")
+    if isinstance(data, str) and data.startswith("0x08c379a0"):  # Error(string)
+        # Skip selector + offset boilerplate to get the string; or use eth_abi:
+        try:
+            # 4 bytes selector + 32 offset + 32 len = 68 bytes header
+            msg_len = int(data[136:136+64], 16)
+            raw = bytes.fromhex(data[200:200+msg_len*2])
+            return to_text(raw)
+        except Exception:
+            pass
+    return err_dict.get("message", "execution reverted")
 
 def simulate_call(
     contract_function,
@@ -108,69 +121,30 @@ def simulate_call(
         # Most useful error for devs
         raise BlockchainError(f"Simulation reverted: {e}") from e
     except ValueError as e:
-        # JSON-RPC error shape commonly in e.args[0]
-        msg = e.args[0].get("message") if e.args and isinstance(e.args[0], dict) else str(e)
+        msg = _extract_revert_msg(e.args[0]) if e.args and isinstance(e.args[0], dict) else str(e)
         raise BlockchainError(f"Simulation failed: {msg}") from e
     except Exception as e:
         raise BlockchainError(f"Simulation failed: {e}") from e
 
 
-def estimate_gas(
-    contract_function,
-    from_address: str,
-    nonce: int,
-    value: int = 0,
-    gas_limit_cap: int = 1_200_000,
-) -> int:
-    """
-    Try to get an accurate estimate. Add a small buffer and cap. If estimate fails,
-    let caller decide a default fallback.
-    """
-    est = contract_function.estimate_gas({"from": from_address, "nonce": nonce, "value": value})
-    gas_limit = int(est * 1.20)  # 20% buffer
-    gas_limit = min(gas_limit, gas_limit_cap)
-    return gas_limit
+def estimate_gas(contract_function, from_address, nonce, value=0, gas_limit_cap=1_200_000, fee_params=None):
+    params = {"from": from_address, "nonce": nonce, "value": value}
+    if fee_params and {"maxFeePerGas","maxPriorityFeePerGas"} <= fee_params.keys():
+        params |= {"maxFeePerGas": fee_params["maxFeePerGas"], "maxPriorityFeePerGas": fee_params["maxPriorityFeePerGas"]}
+    est = contract_function.estimate_gas(params)
+    return min(int(est * 1.20), gas_limit_cap)
 
 
-def wait_for_confirmations(
-    w3: Web3,
-    tx_hash: bytes,
-    confirmations: int = 3,
-    timeout_s: int = 180,
-    poll_interval: float = 1.0,
-):
-    """
-    Wait for inclusion, verify success, then wait N block confirmations.
-    """
-    start = time.time()
-    tx_hex = tx_hash.hex()
-    logger.info(f"Waiting for inclusion: {tx_hex} (timeout={timeout_s}s)")
-    try:
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout_s)
-    except TimeExhausted as e:
-        raise BlockchainError(f"Transaction not mined within {timeout_s}s: {tx_hex}") from e
-
+def wait_for_confirmations(w3, tx_hash, confirmations=3, inclusion_timeout_s=120, conf_timeout_s=180, poll_interval=1.0):
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=inclusion_timeout_s)
     if receipt.status != 1:
-        raise BlockchainError(
-            f"Transaction reverted in block {receipt.blockNumber}: {tx_hex}"
-        )
-
-    # Wait for N confirmations
+        raise BlockchainError(f"Transaction reverted in block {receipt.blockNumber}: {tx_hash.hex()}")
     target = receipt.blockNumber + confirmations
-    logger.info(
-        f"Included in block {receipt.blockNumber}, waiting for {confirmations} confirmations "
-        f"(→ ≥{target})."
-    )
-    while True:
-        if time.time() - start > timeout_s:
-            raise BlockchainError(
-                f"Timed out while waiting for {confirmations} confirmations: {tx_hex}"
-            )
-        head = w3.eth.block_number
-        if head >= target:
-            break
+    t0 = time.time()
+    while w3.eth.block_number < target:
+        if time.time() - t0 > conf_timeout_s:
+            raise BlockchainError(f"Timed out waiting for {confirmations} confirmations: {tx_hash.hex()}")
         time.sleep(poll_interval)
-
     return receipt
 
 
@@ -204,15 +178,15 @@ def safe_send(
 
     # ---- 2) nonce + gas + fees
     use_nonce = resolve_nonce(w3, addr, nonce)
+    fee_params = suggest_fees(w3, urgency=urgency)
+
     try:
         gas_limit = estimate_gas(
-            contract_function, addr, use_nonce, value=value, gas_limit_cap=gas_limit_cap
+            contract_function, addr, use_nonce, value=value, gas_limit_cap=gas_limit_cap, fee_params=fee_params
         )
     except Exception as e:
         logger.warning(f"{op_name}: gas estimate failed: {e}; using default={default_gas_limit}")
         gas_limit = default_gas_limit
-
-    fee_params = suggest_fees(w3, urgency=urgency)
     
     # Guard against RPC oddities: ensure maxFeePerGas >= maxPriorityFeePerGas
     if "maxFeePerGas" in fee_params and "maxPriorityFeePerGas" in fee_params:
@@ -266,16 +240,13 @@ def safe_send(
     # ---- 4) wait for confirmations, possibly speed up if stuck
     try:
         receipt = wait_for_confirmations(
-            w3, tx_hash, confirmations=confirmations, timeout_s=timeout_s, poll_interval=poll_interval
+            w3=w3, tx_hash=tx_hash, confirmations=confirmations, conf_timeout_s=timeout_s, inclusion_timeout_s=timeout_s, poll_interval=poll_interval
         )
+
+        eff = receipt.get("effectiveGasPrice")
         logger.info(
-            f"✅ {op_name} confirmed: {tx_hex} | block={receipt.blockNumber} "
-            f"gasUsed={receipt.gasUsed} "
-            + (
-                f"effGasPrice={_fmt_gwei(receipt.effectiveGasPrice)}"
-                if hasattr(receipt, "effectiveGasPrice") and receipt.effectiveGasPrice
-                else ""
-            )
+            f"✅ {op_name} confirmed: {tx_hex} | block={receipt.blockNumber} gasUsed={receipt.gasUsed}"
+            + (f" effGasPrice={_fmt_gwei(eff)}" if eff is not None else "")
         )
 
         return tx_hash, receipt
@@ -291,7 +262,6 @@ def safe_send(
         attempts = 0
         last_err = first_err
         while attempts < 2:  # keep minimal (1–2 attempts)
-            time.sleep(2 ** attempts)  # Exponential backoff
             attempts += 1
             bump_fees = suggest_fees(w3, urgency="urgent")
             if "maxFeePerGas" in bump_fees:
@@ -312,10 +282,11 @@ def safe_send(
                     f"↻ Speed-up attempt {attempts}: {_fmt_gwei(bump_fees.get('maxFeePerGas', bump_fees.get('gasPrice', 0)))} → {tx_hex}  {_explorer_url(tx_hex)}"
                 )
                 receipt = wait_for_confirmations(
-                    w3,
-                    tx_hash,
+                    w3=w3,
+                    tx_hash=tx_hash,
                     confirmations=confirmations,
-                    timeout_s=timeout_s,
+                    conf_timeout_s=timeout_s,
+                    inclusion_timeout_s=timeout_s,
                     poll_interval=poll_interval,
                 )
                 logger.info(
@@ -337,20 +308,84 @@ def safe_send(
         raise last_err
 
 
-def load_contract(
-    address: str,
-    abi_path: str
-):
-    """
-    Loads a contract from an address and ABI.
-    """
 
+
+def get_creation():
+    jpg1_path = "Eden_creation_gene3_A-group-of-humans-and-cute-cyborgs-living-vanlife-in-the-desert,_66e7305c058bec36f6c4c306_0.png"
+
+    ipfs_image = ipfs.pin(jpg1_path)
+    image_hash = ipfs_image.split("/")[-1]
+    
+    json_data = {
+        "description": "here is a description",
+        "external_url": "https://abraham.ai",
+        "image": f"ipfs://{image_hash}",
+        "name": "Abraham Says hello",
+        "attributes": [
+            {
+                "trait_type": "Medium",
+                "value": "Digital Genesis"
+            },
+            {
+                "trait_type": "Palette",
+                "value": "Quantum Purple"
+            },
+            {
+                "trait_type": "Origin",
+                "value": "Collective Imagination"
+            },
+            {
+                "trait_type": "Autonomy Level",
+                "value": "Emergent"
+            }
+        ]
+    }
+
+    ipfs_url = ipfs.pin(json_data)
+    ipfs_hash = ipfs_url.split("/")[-1]
+
+    return ipfs_hash
+
+
+
+# ---------- Test/main ----------
+
+def main():
     # Load ABI
-    with open(abi_path, "r") as f:
-        abi = json.load(f)
+    with open(CONTRACT_ABI_AUCTION, "r") as f:
+        contract_abi = json.load(f)
 
     w3 = make_w3()
     owner = Account.from_key(PRIVATE_KEY)
-    contract = w3.eth.contract(address=address, abi=abi)
-    
-    return w3, owner, contract
+
+    contract = w3.eth.contract(address=CONTRACT_ADDRESS_AUCTION, abi=contract_abi)
+
+    # Get the creation
+    ipfs_hash = get_creation()
+
+    # Your test function call
+    contract_function = contract.functions.setTokenURI(
+        0,
+        f"ipfs://{ipfs_hash}"
+    )
+
+    # contract_function = contract.functions.startGenesisAuction()
+
+    # Send with slightly aggressive fees and 3 confirmations
+    try:
+        safe_send(
+            w3,
+            contract_function,
+            owner,
+            op_name="SET_TOKEN_URI",
+            nonce=None,               # or set an explicit nonce to pin
+            value=0,                  # non-payable
+        )
+
+    except BlockchainError as e:
+        logger.error(f"❌ SET_TOKEN_URI failed: {e}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
