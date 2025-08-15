@@ -281,6 +281,11 @@ def safe_send(
         return tx_hash, receipt
 
     except BlockchainError as first_err:
+        # Check if transaction reverted (already mined) vs timeout (still pending)
+        if "reverted" in str(first_err).lower():
+            # Transaction was mined but reverted - cannot replace with same nonce
+            raise
+        
         # Inclusion/confirmation timeout. Optionally replace with higher tip and try once or twice.
         if not speed_up_on_timeout:
             raise
