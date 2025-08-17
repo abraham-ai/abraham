@@ -6,9 +6,9 @@ load_dotenv()
 
 
 # ──────────  PARAMS  ──────────
-DEBUG                 = False
+DEBUG                 = os.getenv("DEBUG", "False").lower() == "true"
 APP_NAME              = "abraham"
-GENERATION_COUNT      = 16
+GENERATION_COUNT      = 8
 MODEL_NAME            = "claude-sonnet-4-20250514"
 FALLBACK_MODEL_NAME   = "gpt-4o"
 MAX_PARALLEL_WORKERS  = 4
@@ -18,8 +18,8 @@ DB                    = os.getenv("DB", "STAGE")
 
 # ──────────  TIMING  ──────────
 TIMEZONE              = "America/New_York"
-GENESIS_TIME          = "13:45"          # When to start the daily tournament
-UPDATE_INTERVAL       = 10              # Minutes between update cycles
+GENESIS_TIME          = "10:00"          # When to start the daily tournament
+UPDATE_INTERVAL       = 15              # Minutes between update cycles
 DESTROY_N_UPDATES     = 3               # Run destroy every N update cycles
 # CYCLE_CHECK_INTERVAL  = 15              # Minutes between orchestrator checks
 

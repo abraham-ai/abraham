@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
+import ipfs
+
 from chain import (
     safe_send,
     BlockchainError,
@@ -12,15 +14,11 @@ from chain import (
 
 from config import (
     logger, 
-    BASE_SEPOLIA_RPC,
-    PRIVATE_KEY,
     CONTRACT_ADDRESS_TOURNAMENT,
     CONTRACT_ABI_TOURNAMENT,
-    CHAIN_ID,
-    GAS_LIMIT_CREATE_SESSION,
-    GAS_LIMIT_UPDATE_SESSION,
     SUBGRAPH_URL,
     ABRAHAM_ADDRESS,
+    IPFS_PREFIX,
 )
 
 
@@ -97,14 +95,14 @@ def get_tournament_data(
                 {where_arg}
             ) {{
                 id
+                closed
+                ethSpent
                 firstMessageAt
                 lastActivityAt
-                closed
                 messages(first: $firstMsgs, orderBy: timestamp, orderDirection: asc) {{
                     uuid
                     author
-                    content
-                    media
+                    cid
                     praiseCount
                     timestamp
                     praises {{
@@ -198,6 +196,10 @@ async def get_new_blessings(
         
         for msg in messages[start_index:]:
             if msg.get('author', '').lower() != ABRAHAM_ADDRESS.lower():
+                ipfs_url = f"{IPFS_PREFIX}{msg['cid']}"
+                response = requests.get(ipfs_url)
+                json_data = response.json()
+                msg["content"] = json_data["content"]
                 new_blessings.append(msg)
         
         logger.debug(f"Found {len(new_blessings)} new blessings")
@@ -210,7 +212,8 @@ async def get_new_blessings(
 
 def create_session(
     session_id: str,
-    first_message_id: str,
+    message_id: str,
+    created_at: datetime,
     content: str,
     media: str
 ):
@@ -218,10 +221,11 @@ def create_session(
     Create a new session.
 
     Args:
-        session_id - unique id for the session
-        first_message_id - message id of abraham's first message
-        content - message content
-        media - optional ipfs url
+        session - dictionary with the following keys:
+            - session_id - unique id for the session
+            - message_id - message id of abraham's first message
+            - content - message content
+            - media - optional ipfs url
     """
     try:
         w3, owner, contract = load_contract(
@@ -229,11 +233,29 @@ def create_session(
             abi_path=CONTRACT_ABI_TOURNAMENT
         )
 
+        json_data = {
+            "sessionId": session_id,
+            "messageId": message_id,
+            "createdAt": int(created_at.timestamp()),
+            "author": ABRAHAM_ADDRESS,
+            "kind": "owner",
+            "content": content
+        }
+
+        if media:
+            media_cid = ipfs.pin(media)
+            json_data["media"] = [{
+                "type": "image",
+                "mime": "image/webp",
+                "src": f"https://gateway.pinata.cloud/ipfs/{media_cid}"
+            }]
+
+        cid = ipfs.pin(json_data)
+
         contract_function = contract.functions.createSession(
             sessionId=session_id,
-            firstMessageId=first_message_id, 
-            content=content,
-            media=media
+            firstMessageId=message_id,
+            cid=cid
         )
 
         safe_send(
@@ -247,51 +269,6 @@ def create_session(
 
     except BlockchainError as e:
         logger.error(f"❌ CREATE_SESSION failed: {e}")
-        raise
-
-
-def update_session(
-    session_id: str,
-    message_id: str,
-    content: str,
-    media: str,
-    closed: bool
-):
-    """
-    Update a session with a new message.
-
-    Args:
-        session_id
-        message_id - message id of abraham's last message
-        content - message content
-        media - optional ipfs url
-        closed (bool) - to close the session
-    """
-    try:
-        w3, owner, contract = load_contract(
-            address=CONTRACT_ADDRESS_TOURNAMENT,
-            abi_path=CONTRACT_ABI_TOURNAMENT
-        )
-
-        contract_function = contract.functions.abrahamUpdate(
-            sessionId=session_id,
-            messageId=message_id, 
-            content=content,
-            media=media,
-            closed=closed
-        )
-
-        safe_send(
-            w3,
-            contract_function,
-            owner,
-            op_name="ABRAHAM_UPDATE",
-            nonce=None,               # or set an explicit nonce to pin
-            value=0,                  # non-payable
-        )
-
-    except BlockchainError as e:
-        logger.error(f"❌ ABRAHAM_UPDATE failed: {e}")
         raise
 
 
@@ -314,13 +291,29 @@ def create_session_batch(
             abi_path=CONTRACT_ABI_TOURNAMENT
         )
 
+        for session in sessions:
+            json_data = {
+                "sessionId": session["session_id"],
+                "messageId": session["message_id"],
+                "createdAt": int(session["created_at"].timestamp()),
+                "author": ABRAHAM_ADDRESS,
+                "kind": "owner",
+                "content": session["content"]
+            }
+            if session.get("media"):
+                media_cid = ipfs.pin(session["media"])
+                json_data["media"] = [{
+                    "type": "image",
+                    "mime": "image/webp",
+                    "src": f"https://gateway.pinata.cloud/ipfs/{media_cid}"
+                }]
+            session["cid"] = ipfs.pin(json_data)
+
         session_data = [
             {
                 "sessionId": session["session_id"],
                 "firstMessageId": session["message_id"],
-                "content": session["content"],
-                "media": session["media"],
-                "closed": False
+                "cid": session["cid"]
             }
             for session in sessions
         ]
@@ -338,9 +331,72 @@ def create_session_batch(
             value=0,                  # non-payable
         )
 
-
     except BlockchainError as e:
         logger.error(f"❌ ABRAHAM_BATCH_CREATE failed: {e}")
+        raise
+
+
+def update_session(
+    session_id: str,
+    message_id: str,
+    created_at: datetime,
+    content: str,
+    media: str,
+    closed: bool
+):
+    """
+    Update a session with a new message.
+
+    Args:
+        session_id
+        message_id - message id of abraham's last message
+        content - message content
+        media - optional ipfs url
+        closed (bool) - to close the session
+    """
+    try:
+        w3, owner, contract = load_contract(
+            address=CONTRACT_ADDRESS_TOURNAMENT,
+            abi_path=CONTRACT_ABI_TOURNAMENT
+        )
+
+        json_data = {
+            "sessionId": session_id,
+            "messageId": message_id,
+            "createdAt": int(created_at.timestamp()),
+            "author": ABRAHAM_ADDRESS,
+            "kind": "owner",
+            "content": content,
+        }
+
+        if media:
+            media_cid = ipfs.pin(media)
+            json_data["media"] = [{
+                "type": "image",
+                "mime": "image/webp",
+                "src": f"https://gateway.pinata.cloud/ipfs/{media_cid}"
+            }]
+
+        cid = ipfs.pin(json_data)
+
+        contract_function = contract.functions.abrahamUpdate(
+            sessionId=session_id,
+            messageId=message_id, 
+            cid=cid,
+            closed=closed
+        )
+
+        safe_send(
+            w3,
+            contract_function,
+            owner,
+            op_name="ABRAHAM_UPDATE",
+            nonce=None,               # or set an explicit nonce to pin
+            value=0,                  # non-payable
+        )
+
+    except BlockchainError as e:
+        logger.error(f"❌ ABRAHAM_UPDATE failed: {e}")
         raise
 
 
@@ -364,12 +420,29 @@ def update_session_batch(
             abi_path=CONTRACT_ABI_TOURNAMENT
         )
 
+        for session in sessions:
+            json_data = {
+                "sessionId": session["session_id"],
+                "messageId": session["message_id"],
+                "createdAt": int(session["created_at"].timestamp()),
+                "author": ABRAHAM_ADDRESS,
+                "kind": "owner",
+                "content": session["content"]
+            }
+            if session.get("result_url"):
+                media_cid = ipfs.pin(session["result_url"])
+                json_data["media"] = [{
+                    "type": "image",
+                    "mime": "image/webp",
+                    "src": f"https://gateway.pinata.cloud/ipfs/{media_cid}"
+                }]
+            session["cid"] = ipfs.pin(json_data)
+
         session_data = [
             {
                 "sessionId": session["session_id"],
                 "messageId": session["message_id"],
-                "content": session["content"],
-                "media": session["media"],
+                "cid": session["cid"],
                 "closed": session["closed"]
             }
             for session in sessions
@@ -393,7 +466,6 @@ def update_session_batch(
         raise
 
 
-
 def close_all_open_sessions():
     """Close open sessions from the last day"""
 
@@ -407,8 +479,9 @@ def close_all_open_sessions():
     update_session_batch([
         {
             "session_id": session_id,
-            "message_id": "9999",
-            "content": "Closed by Abraham",
+            "message_id": "999999",
+            "created_at": today,
+            "content": "Closed by Abraham!",
             "media": "",
             "closed": True
         } 
@@ -417,7 +490,3 @@ def close_all_open_sessions():
 
     logger.info(f"Closed {len(active_sessions)} active sessions")
     
-
-
-if __name__ == "__main__":
-    close_all_open_sessions()

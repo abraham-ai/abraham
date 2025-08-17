@@ -23,53 +23,6 @@ class IPFSError(Exception):
     retry=retry_if_exception_type((IPFSError, requests.RequestException)),
     before_sleep=lambda retry_state: logger.info(f"Retrying IPFS upload (attempt {retry_state.attempt_number}/3)...")
 )
-def pin_old(data: str) -> str:
-    """Upload data to Pinata and return IPFS URL with retry logic."""
-    try:
-        if not PINATA_JWT:
-            raise IPFSError("PINATA_JWT not configured")
-            
-        headers = {"Authorization": f"Bearer {PINATA_JWT}"}
-        url = f"{IPFS_BASE_URL}/pinning/pinFileToIPFS"
-
-        # Download and upload file
-        if isinstance(data, str) and data.startswith(('http://', 'https://')):
-            response = requests.get(data, timeout=60)
-            if response.status_code != 200:
-                raise IPFSError(f"Failed to download file {data}: {response.status_code}")
-            files = {"file": ("file", response.content)}
-        
-        
-
-        else:
-            raise ValueError("Data must be a URL")
-
-        logger.info("Uploading to IPFS...")
-        response = requests.post(url, files=files, headers=headers, timeout=60)
-        if response.status_code != 200:
-            raise IPFSError(f"IPFS upload failed: {response.status_code}")
-        
-        ipfs_hash = response.json()["IpfsHash"]
-        logger.info(f"Uploaded to IPFS: {ipfs_hash}")
-        return f"{IPFS_PREFIX}{ipfs_hash}"
-        
-    except requests.RequestException as e:
-        raise IPFSError(f"Network error during IPFS upload: {e}")
-    except Exception as e:
-        raise IPFSError(f"IPFS upload error: {e}")
-
-
-
-
-
-
-
-@retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=2, max=32),
-    retry=retry_if_exception_type((IPFSError, requests.RequestException)),
-    before_sleep=lambda retry_state: logger.info(f"Retrying IPFS upload (attempt {retry_state.attempt_number}/3)...")
-)
 def pin(data: Union[str, Mapping[str, Any]]) -> str:
     """
     Upload to Pinata and return an ipfs:// URL.
@@ -127,10 +80,13 @@ def pin(data: Union[str, Mapping[str, Any]]) -> str:
         ipfs_hash = r.json().get("IpfsHash")        
         if not ipfs_hash:
             raise IPFSError(f"Malformed response from IPFS: {r.text}")
-        logger.info(f"Uploaded to IPFS: {ipfs_hash}")
-        return f"{IPFS_PREFIX}{ipfs_hash}"
+        
+        url = f"{IPFS_PREFIX}{ipfs_hash}"
+        logger.info(f"Uploaded to IPFS: {url}")        
+        return ipfs_hash
         
     except requests.RequestException as e:
         raise IPFSError(f"Network error during IPFS upload: {e}")
+
     except Exception as e:
         raise IPFSError(f"IPFS upload error: {e}")

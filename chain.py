@@ -7,15 +7,11 @@ from web3.exceptions import ContractLogicError, TimeExhausted
 from eth_account import Account
 from eth_utils import to_text
 
-import ipfs
-
 from config import (
     logger,
     BASE_SEPOLIA_RPC,
     PRIVATE_KEY,
     CHAIN_ID,
-    CONTRACT_ADDRESS_AUCTION,
-    CONTRACT_ABI_AUCTION,
 )
 
 # ---------- Errors ----------
@@ -57,7 +53,7 @@ def resolve_nonce(w3: Web3, address: str, provided_nonce: Optional[int]) -> int:
 def suggest_fees(
     w3: Web3,
     urgency: str = "fast",
-    min_priority_gwei: float = 1.0,
+    min_priority_gwei: float = 1.25,
 ) -> Dict[str, int]:
     """
     EIP-1559 fee suggestion. Works on Base Sepolia where max_priority_fee may be 0.
@@ -67,7 +63,7 @@ def suggest_fees(
     base_fee = latest.get("baseFeePerGas")
     if base_fee is None:
         # Legacy (no EIP-1559). Small buffer + floor.
-        gp = max(int(w3.eth.gas_price * 1.2), w3.to_wei(min_priority_gwei * 2, "gwei"))
+        gp = max(int(w3.eth.gas_price * 1.25), w3.to_wei(min_priority_gwei * 2, "gwei"))
         return {"gasPrice": gp}
 
     mult = {
@@ -127,7 +123,18 @@ def simulate_call(
         raise BlockchainError(f"Simulation failed: {e}") from e
 
 
-def estimate_gas(contract_function, from_address, nonce, value=0, gas_limit_cap=1_200_000, fee_params=None):
+def estimate_gas(
+    contract_function,
+    from_address: str,
+    nonce: int,
+    value: int = 0,
+    gas_limit_cap: int = 1_200_000,
+    fee_params: Optional[Dict[str, int]] = None,
+) -> int:
+    """
+    Try to get an accurate estimate. Add a small buffer and cap. If estimate fails,
+    let caller decide a default fallback. 
+    """
     params = {"from": from_address, "nonce": nonce, "value": value}
     if fee_params and {"maxFeePerGas","maxPriorityFeePerGas"} <= fee_params.keys():
         params |= {"maxFeePerGas": fee_params["maxFeePerGas"], "maxPriorityFeePerGas": fee_params["maxPriorityFeePerGas"]}
@@ -135,8 +142,23 @@ def estimate_gas(contract_function, from_address, nonce, value=0, gas_limit_cap=
     return min(int(est * 1.20), gas_limit_cap)
 
 
-def wait_for_confirmations(w3, tx_hash, confirmations=3, inclusion_timeout_s=120, conf_timeout_s=180, poll_interval=1.0):
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=inclusion_timeout_s)
+def wait_for_confirmations(
+    w3, 
+    tx_hash, 
+    confirmations=3, 
+    inclusion_timeout_s=120, 
+    conf_timeout_s=180, 
+    poll_interval=1.0
+):
+    """
+    Wait for inclusion, verify success, then wait N block confirmations.
+    """
+    tx_hex = tx_hash.hex()
+    logger.info(f"Waiting for inclusion: {tx_hex} (timeout={inclusion_timeout_s}s)")
+    try:
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=inclusion_timeout_s)
+    except TimeExhausted as e:
+        raise BlockchainError(f"Transaction not mined within {inclusion_timeout_s}s: {tx_hex}") from e
     if receipt.status != 1:
         raise BlockchainError(f"Transaction reverted in block {receipt.blockNumber}: {tx_hash.hex()}")
     target = receipt.blockNumber + confirmations
@@ -159,7 +181,7 @@ def safe_send(
     nonce: Optional[int] = None,
     value: int = 0,
     default_gas_limit: int = 250_000,
-    gas_limit_cap: int = 1_200_000,
+    gas_limit_cap: int = 5_000_000,
     confirmations: int = 3,
     timeout_s: int = 180,
     poll_interval: float = 1.0,
@@ -313,84 +335,20 @@ def safe_send(
         raise last_err
 
 
+def load_contract(
+    address: str,
+    abi_path: str
+):
+    """
+    Loads a contract from an address and ABI.
+    """
 
-
-def get_creation():
-    jpg1_path = "Eden_creation_gene3_A-group-of-humans-and-cute-cyborgs-living-vanlife-in-the-desert,_66e7305c058bec36f6c4c306_0.png"
-
-    ipfs_image = ipfs.pin(jpg1_path)
-    image_hash = ipfs_image.split("/")[-1]
-    
-    json_data = {
-        "description": "here is a description",
-        "external_url": "https://abraham.ai",
-        "image": f"ipfs://{image_hash}",
-        "name": "Abraham Says hello",
-        "attributes": [
-            {
-                "trait_type": "Medium",
-                "value": "Digital Genesis"
-            },
-            {
-                "trait_type": "Palette",
-                "value": "Quantum Purple"
-            },
-            {
-                "trait_type": "Origin",
-                "value": "Collective Imagination"
-            },
-            {
-                "trait_type": "Autonomy Level",
-                "value": "Emergent"
-            }
-        ]
-    }
-
-    ipfs_url = ipfs.pin(json_data)
-    ipfs_hash = ipfs_url.split("/")[-1]
-
-    return ipfs_hash
-
-
-
-# ---------- Test/main ----------
-
-def main():
     # Load ABI
-    with open(CONTRACT_ABI_AUCTION, "r") as f:
-        contract_abi = json.load(f)
+    with open(abi_path, "r") as f:
+        abi = json.load(f)
 
     w3 = make_w3()
     owner = Account.from_key(PRIVATE_KEY)
-
-    contract = w3.eth.contract(address=CONTRACT_ADDRESS_AUCTION, abi=contract_abi)
-
-    # Get the creation
-    ipfs_hash = get_creation()
-
-    # Your test function call
-    contract_function = contract.functions.setTokenURI(
-        0,
-        f"ipfs://{ipfs_hash}"
-    )
-
-    # contract_function = contract.functions.startGenesisAuction()
-
-    # Send with slightly aggressive fees and 3 confirmations
-    try:
-        safe_send(
-            w3,
-            contract_function,
-            owner,
-            op_name="SET_TOKEN_URI",
-            nonce=None,               # or set an explicit nonce to pin
-            value=0,                  # non-payable
-        )
-
-    except BlockchainError as e:
-        logger.error(f"❌ SET_TOKEN_URI failed: {e}")
-        raise
-
-
-if __name__ == "__main__":
-    main()
+    contract = w3.eth.contract(address=address, abi=abi)
+    
+    return w3, owner, contract
