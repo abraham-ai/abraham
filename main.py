@@ -91,7 +91,7 @@ async def genesis(remote=False):
                 session_id=session["session_id"],
                 message_id=session["message_id"],
                 created_at=session["created_at"],
-                content=session["announcement"],
+                content=session["content"],
                 media=session["media"]
             )
 
@@ -453,3 +453,4 @@ async def start_remote():
 @app.function(image=image, timeout=60 * 60, schedule=modal.Period(minutes=UPDATE_INTERVAL))
 async def heartbeat_remote():
     return await heartbeat(remote=True)
+ 
