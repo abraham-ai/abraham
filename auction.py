@@ -1,5 +1,10 @@
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from typing import Optional
+from tenacity import (
+    retry, 
+    stop_after_attempt, 
+    wait_exponential, 
+    retry_if_exception_type
+)
 
 from chain import (
     safe_send,
@@ -22,7 +27,7 @@ from config import (
 )
 def set_token(
     ipfs_hash: str,
-    token_id: Optional[int] = None, 
+    # token_id: Optional[int] = None, 
 ):
     """Update session on blockchain with retry logic and validation."""
     try:
@@ -31,14 +36,15 @@ def set_token(
             CONTRACT_ABI_AUCTION
         )
 
-        if token_id is None:
-            current = contract.functions.getCurrentAuction().call()
-            token_id = current[0]
+        # if token_id is None:
+        #     current = contract.functions.getCurrentAuction().call()
+        #     token_id = current[0]
 
-        logger.info(f"Setting up token {token_id}...")
+        # logger.info(f"Setting up token {token_id}...")
+        logger.info(f"Setting up token next token...")
 
         contract_function = contract.functions.setTokenURI(
-            token_id,
+            # token_id,
             f"ipfs://{ipfs_hash}"
         )
 

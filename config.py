@@ -20,7 +20,7 @@ DB                    = os.getenv("DB", "STAGE")
 TIMEZONE              = "America/New_York"
 GENESIS_TIME          = "10:00"          # When to start the daily tournament
 UPDATE_INTERVAL       = 15              # Minutes between update cycles
-DESTROY_N_UPDATES     = 3               # Run destroy every N update cycles
+DESTROY_N_UPDATES     = 2               # Run destroy every N update cycles
 # CYCLE_CHECK_INTERVAL  = 15              # Minutes between orchestrator checks
 
 # ──────────  CHAIN INFO  ──────────

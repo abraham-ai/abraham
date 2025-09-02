@@ -542,6 +542,7 @@ async def create_video(
 ) -> Session:
     """Create a session to generate artwork with specified model."""
     
+    print("create vdo ", session_id)
     if DEBUG:
         # Return mock session
         logger.info(f"[DEBUG] Creating mock session for task output...")
@@ -569,6 +570,7 @@ async def create_video(
     )
     
     # Setup session
+    print("session_id", session_id)
     session = Session.from_mongo(session_id)
     
     # Create artwork generation message

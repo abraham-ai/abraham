@@ -54,8 +54,8 @@ def get_tournament_data(
     try:
         # Handle date filtering
         date_where_clause = ""
-        if date_filter:            
-            start_timestamp = int(datetime(date_filter.year, date_filter.month, date_filter.day).timestamp())
+        if date_filter:
+            start_timestamp = int(pytz.timezone("US/Eastern").localize(datetime(date_filter.year, date_filter.month, date_filter.day)).timestamp())
             end_timestamp = start_timestamp + 86400  # Add 24 hours            
             date_where_clause = f"firstMessageAt_gte: {start_timestamp}, firstMessageAt_lt: {end_timestamp}"
 

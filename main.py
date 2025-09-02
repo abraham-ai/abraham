@@ -148,12 +148,12 @@ async def update_session(session_data: tuple) -> dict:
 async def update(remote=False):
     """Check all active creations for new blessings and respond if found."""
 
-    today = datetime.now(pytz.timezone('US/Eastern'))
-
+    today = datetime.now(pytz.timezone('US/Eastern'))    
     active_sessions = tournament.get_tournament_data(date_filter=today, closed_filter=False)
     session_ids = [str(s) for s in active_sessions.keys()]
 
     logger.info(f"✓ Active sessions: {', '.join(session_ids)}")
+
     if not active_sessions:
         logger.warning("⚠️ No active sessions found - nothing to update")
         return {
@@ -262,12 +262,10 @@ async def close():
     logger.info("✅ Destroy cycle complete")
 
 
-
-async def finish(winner_id, winner_data):
+async def finish(winner_id):
     """Finish the tournament."""
 
     logger.info(f"🏆 Winner: {winner_id}")
-    logger.info(f"🏆 Winner data: {winner_data}")
 
     video_result = await eden.create_video(winner_id, MODEL_NAME, FALLBACK_MODEL_NAME)
     
@@ -370,17 +368,17 @@ async def heartbeat(remote=False):
         if should_finish:
             STATE["state"] = "finishing"            
             try:
-                winner_id, winner_data = list(active_sessions.items())[0]
+                winner_id = list(active_sessions.keys())[0]
                 if remote:
-                    finish_remote.local(winner_id, winner_data)
+                    finish_remote.remote(winner_id)
                 else:
-                    await finish(winner_id, winner_data)
+                    await finish(winner_id)
             except Exception as e:
                 logger.error(f"❌ Error in finish: {str(e)}")
             STATE["state"] = "off"
 
 
-async def test():
+async def test_tournament():
     """
     Run a test of the whole tournament.
     """
@@ -430,8 +428,8 @@ async def update_session_remote(session_data: tuple) -> dict:
     return await update_session(session_data)
 
 @app.function(image=image, timeout=60 * 60)
-async def finish_remote(winner_id, winner_data):
-    return await finish(winner_id, winner_data)
+async def finish_remote(winner_id: str):
+    return await finish(winner_id)
 
 @app.function(image=image, timeout=60 * 60)
 async def genesis_remote():
@@ -453,4 +451,10 @@ async def start_remote():
 @app.function(image=image, timeout=60 * 60, schedule=modal.Period(minutes=UPDATE_INTERVAL))
 async def heartbeat_remote():
     return await heartbeat(remote=True)
- 
+
+@app.local_entrypoint()
+def local():
+    asyncio.run(update())
+
+if __name__ == "__main__":
+    asyncio.run(local())
