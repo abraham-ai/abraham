@@ -1,33 +1,37 @@
 """
+Single-file FastAPI + Modal wrapper.
 
-# To run this FastAPI server, use the following uvicorn command:
-# uvicorn farcaster1:app --host 0.0.0.0 --port 8000 --reload
+Deploy:
+    modal deploy farcaster1.py
+    modal run farcaster1.py::show_url
 
-
+Local dev:
+    uvicorn farcaster1:fastapi_app --host 0.0.0.0 --port 8000 --reload
 """
+
 from dotenv import load_dotenv
 load_dotenv()
 
-from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, Header, HTTPException, Request, status
+# ---- stdlib / typing ----
 import os
-import httpx
 import json
 import hmac
-import json
 import hashlib
 import logging
 import uuid
+from typing import Any, Dict, List, Optional, Literal
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Literal
-from bson import ObjectId
-from fastapi import BackgroundTasks
+
+# ---- third-party runtime ----
+import modal  # needed both for wrapper and for in-webhook spawn()
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Request, status, BackgroundTasks
 from fastapi.responses import JSONResponse
 from jinja2 import Template
 from pydantic import BaseModel, Field
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from bson import ObjectId
 
-
+# ---- your libs (eve stack) ----
 from eve.api.api_requests import PromptSessionRequest, SessionCreationArgs
 from eve.api.handlers import setup_session
 from eve.agent.agent import Agent
@@ -35,34 +39,35 @@ from eve.agent.session.session_llm import async_prompt
 from eve.agent.session.session_prompts import system_template
 from eve.agent.session.models import (
     ChatMessage, ChatMessageRequestInput, LLMConfig, 
-    LLMContext, PromptSessionContext, Session
+    LLMContext, PromptSessionContext, Session, UpdateType
 )
 from eve.agent.session.session import (
     add_user_message, 
     async_prompt_session, 
     build_llm_context
 )
-from eve.mongo import Collection, Document
+from eve.mongo import Collection, Document, MongoDocumentNotFound
 from eve.s3 import upload_file_from_url
 from eve.user import User
 from eve.tool import Tool
-from eve.mongo import MongoDocumentNotFound
 from eden import get_current_timestamp
-from eve.agent.session.models import UpdateType
 
+# ======================================================================================
+#                               FastAPI service (ASGI)
+# ======================================================================================
 
+# Load long-lived objects (if these do heavy I/O in your local env, you can lazy-load them)
 abraham = Agent.load("abraham")
 farcaster_tool = Tool.load("farcaster_cast")
 
-
 # ---- Config ----
-TARGET_FID = int(os.getenv("ABRAHAM_FARCASTER_ID"))
+TARGET_FID = int(os.getenv("ABRAHAM_FARCASTER_ID", "0"))
 NEYNAR_WEBHOOK_SECRET = os.getenv("NEYNAR_WEBHOOK_SECRET", "")
 NEYNAR_API_KEY = os.environ["NEYNAR_API_KEY"]
 HDRS = {"accept": "application/json", "api_key": NEYNAR_API_KEY}
 
 # ---- App / Logger ----
-app = FastAPI(title="Neynar Webhook Listener")
+fastapi_app = FastAPI(title="Neynar Webhook Listener")
 logger = logging.getLogger("uvicorn.error")
 
 # ---- Helpers ----
@@ -83,7 +88,6 @@ def _extract_embed_urls(embeds: Any) -> List[str]:
     """
     Embeds can be a list of strings (URLs) or objects with a 'url' key.
     """
-    urls = []
     urls: List[str] = []
     if isinstance(embeds, list):
         for e in embeds:
@@ -192,29 +196,25 @@ def normalize_cast_event(evt: Dict[str, Any]) -> Dict[str, Any]:
 
     # Unify all linked wallets into `author.wallets`
     wallets: List[str] = []
-    # custody address
     if normalized["author"].get("custody_address"):
         wallets.append(normalized["author"]["custody_address"])
-    # legacy `verifications` (eth addrs)
     for addr in normalized["author"].get("verifications") or []:
         wallets.append(addr)
-    # newer `verified_addresses`
     va = normalized["author"].get("verified_addresses")
     if isinstance(va, dict):
         for addr in (va.get("eth_addresses") or []):
             wallets.append(addr)
         for addr in (va.get("sol_addresses") or []):
-            wallets.append(addr)  # sol addresses are base58, don't lowercase
+            wallets.append(addr)  # base58, do not lowercase
         primary = va.get("primary") or {}
         if primary.get("eth_address"):
             wallets.append(primary["eth_address"])
         if primary.get("sol_address"):
             wallets.append(primary["sol_address"])
 
-    # normalize to unique, case-insensitive for hex addresses
     try:
-        hexish = {w.lower(): w for w in wallets if w.startswith("0x")}
-        non_hex = [w for w in wallets if not w.startswith("0x")]
+        hexish = {w.lower(): w for w in wallets if isinstance(w, str) and w.startswith("0x")}
+        non_hex = [w for w in wallets if not (isinstance(w, str) and w.startswith("0x"))]
         unified = sorted(list(hexish.values())) + sorted(set(non_hex))
     except Exception:
         unified = sorted(set(wallets))
@@ -238,7 +238,7 @@ async def fetch_cast_ancestry(cast_hash: str, include_self: bool = True):
     params = {
         "identifier": cast_hash,
         "type": "hash",
-        "reply_depth": 0,  # only ancestors, no children
+        "reply_depth": 0,
         "include_chronological_parent_casts": "true",
     }
     async with httpx.AsyncClient(timeout=30) as client:
@@ -262,16 +262,15 @@ async def fetch_cast_ancestry(cast_hash: str, include_self: bool = True):
 
 
 def is_mention(event: Dict[str, Any], target_fid: int) -> bool:
-    is_mention = target_fid in (event["cast"].get("mentioned_fids") or [])
-    return is_mention
+    return target_fid in (event["cast"].get("mentioned_fids") or [])
 
 
 def is_reply(event: Dict[str, Any], target_fid: int) -> bool:
-    is_reply = event.get("parent_author_fid") == target_fid
-    return is_reply
+    return event.get("parent_author_fid") == target_fid
 
 
 async def process_event_pipeline(event: Dict[str, Any]):
+    event_doc: Optional[FarcasterEvent] = None
     try:
         cast_hash = event["cast"]["hash"]
         event_doc = FarcasterEvent(
@@ -280,6 +279,7 @@ async def process_event_pipeline(event: Dict[str, Any]):
             status="running",
         )
         event_doc.save()
+
         session, new_messages = await handle_farcaster(event)
         compact_message = await compact_messages(session, new_messages)
 
@@ -312,17 +312,14 @@ async def process_event_pipeline(event: Dict[str, Any]):
             )
 
     except Exception as e:
-        event_doc.update(
-            status="failed",
-            error=str(e),
-        )
+        if event_doc is not None:
+            event_doc.update(status="failed", error=str(e))
+        else:
+            logger.exception("Failed before event_doc creation: %s", e)
 
 
-async def handle_farcaster(
-    event: Dict[str, Any],
-) -> Session:
+async def handle_farcaster(event: Dict[str, Any]) -> Session:
     """Create a session to generate artwork with specified model."""
-
     cast = event["cast"]
     cast_hash = cast["hash"]
     thread_hash = cast["thread_hash"]
@@ -344,7 +341,7 @@ async def handle_farcaster(
         ),
     )
 
-    # grab attachment urls
+    # attachments
     embed_urls = _extract_embed_urls(cast.get("embeds"))
     split = _split_media(embed_urls)
     media_urls = split.get("media_urls") or []
@@ -360,7 +357,7 @@ async def handle_farcaster(
         request.session_id = str(session.id)
 
     # if no session found, create a new one
-    except MongoDocumentNotFound as e:
+    except MongoDocumentNotFound:
         background_tasks = BackgroundTasks()
         request.creation_args = SessionCreationArgs(
             owner_id=str(user.id),
@@ -378,8 +375,8 @@ async def handle_farcaster(
         # if the cast is not the original, get the previous casts and add them to the session
         if thread_hash != cast_hash:
             prev_casts = await fetch_cast_ancestry(cast_hash, include_self=False)
-            for cast in prev_casts:
-                author_fid_, author_username_, text_, media_urls_ = await process_cast(cast)
+            for c in prev_casts:
+                author_fid_, author_username_, text_, media_urls_ = await process_cast(c)
                 media_urls_ = upload_to_s3(media_urls_)
                 if author_fid_ == TARGET_FID:
                     role = "assistant"
@@ -397,7 +394,6 @@ async def handle_farcaster(
                 message.save()
                 session.messages.append(message.id)
             session.save()
-
 
     # Create context with selected model
     context = PromptSessionContext(
@@ -421,9 +417,7 @@ async def handle_farcaster(
     new_messages = []
     
     # Execute the prompt session
-    async for update in async_prompt_session(
-        session, context, abraham
-    ):
+    async for update in async_prompt_session(session, context, abraham):
         if update.type == UpdateType.ASSISTANT_MESSAGE:
             new_messages.append(update.message)
 
@@ -432,7 +426,6 @@ async def handle_farcaster(
 
 class CompactMessage(BaseModel):
     """Condense your last messages and any tool results into a single message with resulting media attachments."""
-    
     content: Optional[str] = Field(description="Content of the message. Cannot exceed 320 characters.")
     media_urls: Optional[List[str]] = Field(description="URLs of any images or videos to attach")
 
@@ -444,16 +437,12 @@ Given your last messages (starting from the message which begins with "{{message
 media_urls: any successfully produced images, videos, or other media produced by your tool calls
 content: a single message, not exceeding 320 characters, which swaps these original messages with a new one which summarizes or restates the original messages as though the whole sequence 
 
-This new message is meant to abstract your original messages -- which may include various thinking, statements of intent (e.g. "Let me ..."), tool calls and results, error handling and retries, or tool sequences -- into a single summarial message in the same tone of your original messages which gives the high level of what you did."""
+This new message is meant to abstract your original messages -- which may include various thinking, statements of intent (e.g. "Let me ..."), tool calls and results, error handling and retries, or tool sequences -- into a single summarial message in the same tone of your original messages which gives the high level of what you did.
+"""
 
 
-async def compact_messages(
-    session: Any,
-    new_messages: List[ChatMessage],
-) -> CompactMessage:
+async def compact_messages(session: Any, new_messages: List[ChatMessage]) -> CompactMessage:
     """Extract a compact message from the last assistant messages."""
-    
-    # Prepare system message
     system_message = system_template.render(
         name=abraham.name,
         current_date_time=get_current_timestamp(),
@@ -461,15 +450,11 @@ async def compact_messages(
         persona=abraham.persona,
         tools=None
     )
-    
-    # Get session messages
+
     messages = [ChatMessage.from_mongo(m) for m in session.messages]
-    
-    # An instruction to compact the messages
-    message_ref = new_messages[0].content[:25]
+    message_ref = (new_messages[0].content or "")[:25]
     instruction = Template(CAST_TEMPLATE).render(message_ref=message_ref)
 
-    # Build validation context
     context = LLMContext(
         messages=[
             ChatMessage(role="system", content=system_message), 
@@ -481,16 +466,26 @@ async def compact_messages(
             response_format=CompactMessage
         )
     )
-    
-    # Get compact result
     response = await async_prompt(context)
-
-    result = CompactMessage(**json.loads(response.content)) 
-
+    result = CompactMessage(**json.loads(response.content))
     return result
 
 
-@app.post("/neynar/webhook")
+
+@fastapi_app.post("/mytesthook")
+async def neynar_webhook(
+    request: Request,
+):
+    print("mytesthook 1 accepted")
+    print(request)
+    print("mytesthook 2 accepted")
+    print(await request.body())
+    print("mytesthook 3 accepted")
+    return JSONResponse({"status": "accepted"}, status_code=200)
+
+
+
+@fastapi_app.post("/neynar/webhook")
 async def neynar_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -523,179 +518,107 @@ async def neynar_webhook(
     if not (is_reply(event, TARGET_FID) or is_mention(event, TARGET_FID)):
         return JSONResponse({"status": "skip.not_relevant"}, status_code=200)
 
-    # get idem_key, save to database
+    # de-dupe
     cast_hash = event["cast"]["hash"]
-
     if FarcasterEvent.find_one({"cast_hash": cast_hash}):
         return JSONResponse({"status": "duplicate_ignored"}, status_code=200)
 
     # --- Offload heavy work; ACK immediately ---
-    # Todo: turn this into a remote job
-    # background_tasks.add_task(process_event_pipeline, event)
-    PROCESSOR = modal.Function.from_name(
-        os.environ.get("APP_NAME", f"abraham-neynar-{os.environ.get('DB','stage')}"),
-        "process_event_job",
-    )
-    PROCESSOR.spawn(event)
-
-
+    try:
+        processor = modal.Function.from_name(
+            os.environ.get("APP_NAME", f"abraham-neynar-{os.environ.get('DB','stage')}"),
+            "process_event_job",
+        )
+        processor.spawn(event)   # fire-and-forget on Modal infra
+    except Exception as _e:
+        # Fallback to in-process background task (keeps webhook snappy)
+        background_tasks.add_task(process_event_pipeline, event)
 
     return JSONResponse({"status": "accepted"}, status_code=200)
 
 
-@app.get("/healthz")
+@fastapi_app.get("/healthz")
 def healthz():
     return {"ok": True}
 
 
-async def test():
-    from farcaster_examples import reply_to_root, reply_to_inner_abraham_message, reply_to_inner_abraham_message_with_media, root_message    
-    event = reply_to_inner_abraham_message_with_media
-    
-    event = normalize_cast_event(event)
-    
-    parent_hash = event["cast"]["hash"]
-    parent_fid = event["author"]["fid"]
+# ======================================================================================
+#                               Modal wrapper (deployable)
+# ======================================================================================
 
-    session, new_messages = await handle_farcaster(event)
-    compact_message = await compact_messages(session, new_messages)
-    
-    args = {
-        "agent_id": str(abraham.id),
-        "text": compact_message.content,
-        "embeds": compact_message.media_urls or [],
-    }
-    if parent_hash and parent_fid:
-        args.update({
-            "parent_hash": parent_hash,
-            "parent_fid": parent_fid
-        })
-        
-    await farcaster_tool.async_run(args)
-
-
-
-async def test2():
-    args = {
-        "agent_id": str(abraham.id),
-        "text": "Testing multiple embeds",
-        "embeds": [
-            "https://dtut5r9j4w7j4.cloudfront.net/fa9ac3d30421a38de63753b87d2e43a6a84ee3243c1531ef9ceb0e8e899466ef.png",
-            "https://edenartlab-stage-data.s3.amazonaws.com/597347af971702b9f58d162b455552bada24170b7d7b8875204ac8f6ea500221.jpg",
-            "https://dtut5r9j4w7j4.cloudfront.net/7e3351faea8bdf2ebddf40d068e2776ae6883341d54b683833efa4195084b1e5.png",
-            "https://dtut5r9j4w7j4.cloudfront.net/681ffdc3f50e8a15d975e38bb562b1d1b2c9d14e83e235b6c90e38a1392c668c.png" 
-        ]
-    }
-    await farcaster_tool.async_run(args)
-
-
-
-# if __name__ == "__main__":
-#     import asyncio
-#     asyncio.run(test2())
-
-
-
-
-
-
-
-
-
-
-
-
-
-# modal_farcaster.py
-import os
-import modal
-
-# ---- Config you may tweak ----
-DB = os.environ.get("DB", "stage")  # used by your own code/secrets naming
+# ---- Config for Modal app & image ----
+DB = os.environ.get("DB", "STAGE")
 APP_NAME = os.environ.get("APP_NAME", f"abraham-neynar-{DB}")
 
-# Build the runtime image
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .env({  # make local modules importable and pass DB through
-        "DB": DB,
-        "PYTHONPATH": "/root",
-    })
+    .env({"DB": DB})
     .apt_install("git", "libmagic1", "ffmpeg", "wget")
-    # include FastAPI runtime + libs your code uses directly
-    .pip_install(
-        "fastapi[standard]",    # includes Starlette, Uvicorn, pydantic, etc.
-        "httpx",                # used in farcaster1.py
-        "boto3",                # S3 (eve likely depends on this, but explicit is safe)
-        "web3",
-        "eth-account",
-        "requests",
-        "jinja2",
-        "python-dotenv",
-        "pytz",
-        "tenacity",
-        "pymongo[srv]",         # for bson.ObjectId via pymongo's bson
-    )
+    .pip_install("web3", "eth-account", "requests", "jinja2", "python-dotenv", "pytz", "tenacity")
+    .run_commands("echo 'Hello, world!!!'")
     .run_commands(
         "git clone https://github.com/edenartlab/eve.git /root/eve-repo",
         "cd /root/eve-repo && git checkout staging && pip install -e .",
     )
-    # If these files live in your repo and are imported by your code, ship them into the image.
-    # (Remove any that you don't actually import.)
     .add_local_file("config.py", "/root/config.py")
     .add_local_file("eden.py", "/root/eden.py")
     .add_local_file("chain.py", "/root/chain.py")
     .add_local_file("ipfs.py", "/root/ipfs.py")
     .add_local_file("tournament.py", "/root/tournament.py")
     .add_local_file("auction.py", "/root/auction.py")
-    .add_local_file("farcaster1.py", "/root/farcaster1.py")
-    # .add_local_file("contract_abi_tournament.json", "/root/contract_abi_tournament.json")
-    # .add_local_file("contract_abi_auction.json", "/root/contract_abi_auction.json")
+    .add_local_file("contract_abi_tournament.json", "/root/contract_abi_tournament.json")
+    .add_local_file("contract_abi_auction.json", "/root/contract_abi_auction.json")
 )
 
-# Modal app handle
-m_app = modal.App(APP_NAME)
+
+# Modal app handle (must be named `app` so `modal deploy farcaster1.py` finds it)
+app = modal.App(APP_NAME)
 
 SECRETS = [
     modal.Secret.from_name("eve-secrets"),
     modal.Secret.from_name(f"eve-secrets-{DB}"),
     modal.Secret.from_name("abraham-secrets"),
-    # Put NEYNAR_API_KEY and NEYNAR_WEBHOOK_SECRET in one of the above
-    # or create a dedicated secret and add it here.
+    # Ensure NEYNAR_API_KEY and NEYNAR_WEBHOOK_SECRET live in one of these secrets,
+    # or add another Secret here that includes them.
 ]
 
 # ---- ASGI web server for Neynar webhook ----
-@m_app.function(
+@app.function(
     image=image,
     secrets=SECRETS,
-    timeout=120,             # webhook should ack quickly
-    min_containers=1,        # keep warm for low-latency webhook
-    max_containers=10,       # scale up if needed
+    timeout=120,            # webhook should ack quickly
+    min_containers=1,       # keep warm for low-latency
+    max_containers=10,      # scale up if needed
 )
 @modal.concurrent(max_inputs=100)  # each container can handle many concurrent requests
 @modal.asgi_app()
 def neynar_webhook_asgi():
     """
-    Return the FastAPI app defined in farcaster1.py
+    Expose the FastAPI service in this file as an ASGI app.
     """
-    # Import inside the container after env + secrets are loaded
-    import farcaster1 as service
-    # farcaster1 defines: app = FastAPI(...)
-    return service.app
+    return fastapi_app
 
-# ---- Optional: move heavy work off the request path ----
-@m_app.function(
+
+# ---- Heavy worker (spawn from webhook) ----
+@app.function(
     image=image,
     secrets=SECRETS,
-    timeout=900,           # give background jobs more time
-    max_containers=50,     # allow scale-out for spikes
+    timeout=900,            # allow longer processing
+    max_containers=50,      # scale out for spikes
 )
 async def process_event_job(event: dict) -> None:
-    # Reuse your pipeline
-    from farcaster1 import process_event_pipeline
     await process_event_pipeline(event)
 
-# Convenience: print deployed URL
-@m_app.local_entrypoint()
+
+# Convenience: print the deployed URL
+@app.local_entrypoint()
 def show_url():
     print("Webhook URL:", neynar_webhook_asgi.get_web_url())
+    from eve.agent import Agent
+    a = Agent.load("abraham")
+    from eve.api.api_requests import PromptSessionRequest, SessionCreationArgs
+    from eve.agent.llm import UpdateType
+    from instructor.function_calls import openai_schema
+    print("yes")
+    print(a)
+

@@ -1,3 +1,23 @@
+"""
+
+modal_app.py
+- image
+- app
+
+farcaster_gateway.py
+- webhook
+- process
+
+tournament.py
+
+eden_utils.py
+- genesis -> create N sessions
+- each session ()
+
+
+"""
+
+
 from datetime import datetime
 from bson import ObjectId
 import asyncio
