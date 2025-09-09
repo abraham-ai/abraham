@@ -27,16 +27,12 @@ import modal  # needed both for wrapper and for in-webhook spawn()
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, status, BackgroundTasks
 from fastapi.responses import JSONResponse
-from jinja2 import Template
-from pydantic import BaseModel, Field
 from bson import ObjectId
 
 # ---- your libs (eve stack) ----
 from eve.api.api_requests import PromptSessionRequest, SessionCreationArgs
 from eve.api.handlers import setup_session
 from eve.agent.agent import Agent
-from eve.agent.session.session_llm import async_prompt
-from eve.agent.session.session_prompts import system_template
 from eve.agent.session.models import (
     ChatMessage, ChatMessageRequestInput, LLMConfig, 
     LLMContext, PromptSessionContext, Session, UpdateType
@@ -51,6 +47,7 @@ from eve.s3 import upload_file_from_url
 from eve.user import User
 from eve.tool import Tool
 from eden import get_current_timestamp
+from eden_utils.compact_messages import compact_messages, CompactMessage
 
 # ======================================================================================
 #                               FastAPI service (ASGI)
@@ -427,55 +424,6 @@ async def handle_farcaster(event: Dict[str, Any]) -> Session:
     return session, new_messages
 
 
-class CompactMessage(BaseModel):
-    """Condense your last messages and any tool results into a single message with resulting media attachments."""
-    content: Optional[str] = Field(description="Content of the message. Cannot exceed 320 characters.")
-    media_urls: Optional[List[str]] = Field(description="URLs of any images or videos to attach")
-
-
-CAST_TEMPLATE = """# Compact your last messages into a single message
-
-Given your last messages (starting from the message which begins with "{{message_ref}}"), extract from it the following:
-
-media_urls: any successfully produced images, videos, or other media produced by your tool calls
-content: a single message, not exceeding 320 characters, which swaps these original messages with a new one which summarizes or restates the original messages as though the whole sequence 
-
-This new message is meant to abstract your original messages -- which may include various thinking, statements of intent (e.g. "Let me ..."), tool calls and results, error handling and retries, or tool sequences -- into a single summarial message in the same tone of your original messages which gives the high level of what you did.
-"""
-
-
-async def compact_messages(session: Any, new_messages: List[ChatMessage]) -> CompactMessage:
-    """Extract a compact message from the last assistant messages."""
-
-    abraham = Agent.load("abraham")
-
-    system_message = system_template.render(
-        name=abraham.name,
-        current_date_time=get_current_timestamp(),
-        description=abraham.description,
-        persona=abraham.persona,
-        tools=None
-    )
-
-    messages = [ChatMessage.from_mongo(m) for m in session.messages]
-    message_ref = (new_messages[0].content or "")[:25]
-    instruction = Template(CAST_TEMPLATE).render(message_ref=message_ref)
-
-    context = LLMContext(
-        messages=[
-            ChatMessage(role="system", content=system_message), 
-            *messages,
-            ChatMessage(role="system", content=instruction)
-        ],
-        config=LLMConfig(
-            model="claude-sonnet-4-20250514",
-            response_format=CompactMessage
-        )
-    )
-    response = await async_prompt(context)
-    result = CompactMessage(**json.loads(response.content))
-    return result
-
 
 
 @fastapi_app.post("/mytesthook")
@@ -532,8 +480,8 @@ async def neynar_webhook(
     # --- Offload heavy work; ACK immediately ---
     try:
         processor = modal.Function.from_name(
-            os.environ.get("APP_NAME", f"abraham-neynar-{os.environ.get('DB','stage')}"),
-            "process_event_job",
+            f"abraham-{os.environ.get('DB','STAGE')}",
+            "process_event",
         )
         processor.spawn(event)   # fire-and-forget on Modal infra
     except Exception as _e:
@@ -548,83 +496,6 @@ def healthz():
     return {"ok": True}
 
 
-# ======================================================================================
-#                               Modal wrapper (deployable)
-# ======================================================================================
-
-# ---- Config for Modal app & image ----
-DB = os.environ.get("DB", "STAGE")
-APP_NAME = os.environ.get("APP_NAME", f"abraham-neynar-{DB}")
-
-image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .env({"DB": DB})
-    .apt_install("git", "libmagic1", "ffmpeg", "wget")
-    .pip_install("web3", "eth-account", "requests", "jinja2", "python-dotenv", "pytz", "tenacity")
-    .run_commands("echo 'Hello, world!!!'")
-    .run_commands(
-        "git clone https://github.com/edenartlab/eve.git /root/eve-repo",
-        "cd /root/eve-repo && git checkout staging && pip install -e .",
-    )
-    .add_local_file("config.py", "/root/config.py")
-    .add_local_file("eden.py", "/root/eden.py")
-    .add_local_file("chain.py", "/root/chain.py")
-    .add_local_file("ipfs.py", "/root/ipfs.py")
-    .add_local_file("tournament.py", "/root/tournament.py")
-    .add_local_file("auction.py", "/root/auction.py")
-    .add_local_file("contract_abi_tournament.json", "/root/contract_abi_tournament.json")
-    .add_local_file("contract_abi_auction.json", "/root/contract_abi_auction.json")
-)
-
-
-# Modal app handle (must be named `app` so `modal deploy farcaster1.py` finds it)
-app = modal.App(APP_NAME)
-
-SECRETS = [
-    modal.Secret.from_name("eve-secrets"),
-    modal.Secret.from_name(f"eve-secrets-{DB}"),
-    modal.Secret.from_name("abraham-secrets"),
-    # Ensure NEYNAR_API_KEY and NEYNAR_WEBHOOK_SECRET live in one of these secrets,
-    # or add another Secret here that includes them.
-]
-
-# ---- ASGI web server for Neynar webhook ----
-@app.function(
-    image=image,
-    secrets=SECRETS,
-    timeout=120,            # webhook should ack quickly
-    min_containers=1,       # keep warm for low-latency
-    max_containers=10,      # scale up if needed
-)
-@modal.concurrent(max_inputs=100)  # each container can handle many concurrent requests
-@modal.asgi_app()
-def neynar_webhook_asgi():
-    """
-    Expose the FastAPI service in this file as an ASGI app.
-    """
-    return fastapi_app
-
-
-# ---- Heavy worker (spawn from webhook) ----
-@app.function(
-    image=image,
-    secrets=SECRETS,
-    timeout=900,            # allow longer processing
-    max_containers=50,      # scale out for spikes
-)
-async def process_event_job(event: dict) -> None:
-    await process_event_pipeline(event)
-
-
-# Convenience: print the deployed URL
-@app.local_entrypoint()
-def show_url():
-    print("Webhook URL:", neynar_webhook_asgi.get_web_url())
-    from eve.agent import Agent
-    a = Agent.load("abraham")
-    from eve.api.api_requests import PromptSessionRequest, SessionCreationArgs
-    from eve.agent.llm import UpdateType
-    from instructor.function_calls import openai_schema
-    print("yes")
-    print(a)
+# Note: Modal app definition moved to modal_app.py
+# This file now contains only the business logic functions
 
