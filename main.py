@@ -9,6 +9,11 @@ farcaster_gateway.py
 - process
 
 tournament.py
+- genesis -> create 16 fc posts
+  - webhook -> update
+- heartbeat elimination cycle
+- miracle
+- once a day - self-edit
 
 eden_utils.py
 - genesis -> create N sessions

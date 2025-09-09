@@ -330,6 +330,9 @@ async def handle_farcaster(event: Dict[str, Any]) -> Session:
 
     # Get or create user
     user = User.from_farcaster(author_fid, author_username)
+
+    # Todo:
+    # if author_thumbnail != userImage, set useImage
     
     # get or setup session
     request = PromptSessionRequest(
@@ -375,8 +378,8 @@ async def handle_farcaster(event: Dict[str, Any]) -> Session:
         # if the cast is not the original, get the previous casts and add them to the session
         if thread_hash != cast_hash:
             prev_casts = await fetch_cast_ancestry(cast_hash, include_self=False)
-            for c in prev_casts:
-                author_fid_, author_username_, text_, media_urls_ = await process_cast(c)
+            for pc in prev_casts:
+                author_fid_, author_username_, text_, media_urls_ = await process_cast(pc)
                 media_urls_ = upload_to_s3(media_urls_)
                 if author_fid_ == TARGET_FID:
                     role = "assistant"
@@ -443,6 +446,9 @@ This new message is meant to abstract your original messages -- which may includ
 
 async def compact_messages(session: Any, new_messages: List[ChatMessage]) -> CompactMessage:
     """Extract a compact message from the last assistant messages."""
+
+    abraham = Agent.load("abraham")
+
     system_message = system_template.render(
         name=abraham.name,
         current_date_time=get_current_timestamp(),
