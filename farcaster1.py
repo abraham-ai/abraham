@@ -463,7 +463,8 @@ async def compact_messages(
     )
     
     # Get session messages
-    messages = [ChatMessage.from_mongo(m) for m in session.messages]
+    # messages = [ChatMessage.from_mongo(m) for m in session.messages]
+    messages = session.get_messages()
     
     # An instruction to compact the messages
     message_ref = new_messages[0].content[:25]

@@ -17,7 +17,7 @@ image = (
     .apt_install("git", "libmagic1", "ffmpeg", "wget")
     .pip_install("web3", "eth-account", "requests", "jinja2", "python-dotenv", "pytz", "tenacity", "httpx")
     .run_commands(
-        'echo hellooo'
+        'echo hellooooo'
     )
     .run_commands(
         "git clone https://github.com/edenartlab/eve.git /root/eve-repo",

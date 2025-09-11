@@ -362,7 +362,8 @@ async def validate_creation(
     )
     
     # Get session messages
-    messages = [ChatMessage.from_mongo(m) for m in session.messages]
+    # messages = [ChatMessage.from_mongo(m) for m in session.messages]
+    messages = session.get_messages()
     
     # Build validation context
     context = LLMContext(
@@ -528,7 +529,7 @@ async def close_session(
     async for _ in async_prompt_session(session, context, abraham):
         pass
         
-    assistant_message_id = session.messages[-1]
+    assistant_message_id = session.get_messages()[-1]
     assistant_message = ChatMessage.from_mongo(assistant_message_id)
 
     return assistant_message
@@ -660,7 +661,8 @@ async def validate_video(
     )
     
     # Get session messages
-    messages = [ChatMessage.from_mongo(m) for m in session.messages]
+    # messages = [ChatMessage.from_mongo(m) for m in session.messages]
+    messages = session.get_messages()
     
     # Build validation context
     context = LLMContext(

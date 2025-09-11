@@ -10,17 +10,19 @@ from pydantic import BaseModel, Field
 from eve.agent.agent import Agent
 from eve.agent.session.session_llm import async_prompt
 from eve.agent.session.session_prompts import system_template
-from eve.agent.session.models import ChatMessage, LLMContext, LLMConfig
+from eve.agent.session.models import ChatMessage, LLMContext, LLMConfig, Session
 from eden import get_current_timestamp
 
 
 class CompactMessage(BaseModel):
-    """Condense your last messages and any tool results into a single message with resulting media attachments."""
+    """Condense your last messages and any tool results into single message with resulting media attachments."""
+
     content: Optional[str] = Field(description="Content of the message. Cannot exceed 320 characters.")
     media_urls: Optional[List[str]] = Field(description="URLs of any images or videos to attach")
 
 
-CAST_TEMPLATE = """# Compact your last messages into a single message
+CAST_TEMPLATE = """
+# Compact your last messages into a single message
 
 Given your last messages (starting from the message which begins with "{{message_ref}}"), extract from it the following:
 
@@ -31,7 +33,7 @@ This new message is meant to abstract your original messages -- which may includ
 """
 
 
-async def compact_messages(session: Any, new_messages: List[ChatMessage]) -> CompactMessage:
+async def compact_messages(session: Session, new_messages: List[ChatMessage]) -> CompactMessage:
     """Extract a compact message from the last assistant messages."""
 
     abraham = Agent.load("abraham")
@@ -44,7 +46,7 @@ async def compact_messages(session: Any, new_messages: List[ChatMessage]) -> Com
         tools=None
     )
 
-    messages = [ChatMessage.from_mongo(m) for m in session.messages]
+    messages = session.get_messages()
     message_ref = (new_messages[0].content or "")[:25]
     instruction = Template(CAST_TEMPLATE).render(message_ref=message_ref)
 
@@ -61,4 +63,5 @@ async def compact_messages(session: Any, new_messages: List[ChatMessage]) -> Com
     )
     response = await async_prompt(context)
     result = CompactMessage(**json.loads(response.content))
+    
     return result

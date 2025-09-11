@@ -100,7 +100,7 @@ def _extract_embed_urls(embeds: Any) -> List[str]:
 @Collection("farcaster_events")
 class FarcasterEvent(Document):
     cast_hash: str
-    event: Dict[str, Any]
+    event: Optional[Dict[str, Any]] = None
     status: Literal["running", "completed", "failed"]
     error: Optional[str] = None
     session_id: Optional[ObjectId] = None
@@ -108,6 +108,14 @@ class FarcasterEvent(Document):
     reply_cast: Optional[Dict[str, Any]] = None
     reply_fid: Optional[int] = None
 
+# @Collection("farcaster_sessions")
+# class FarcasterSession(Document):
+#     session_id: str = Field(
+#         description="Eden Session ID"
+#     )
+#     cast_hash: str = Field(
+#         description="The result of the session"
+#     )
 
 def upload_to_s3(media_urls: List[str]) -> List[str]:
     uploaded_urls = []
@@ -228,6 +236,7 @@ async def process_cast(cast: Dict[str, Any]):
     embed_urls = _extract_embed_urls(cast.get("embeds"))
     split = _split_media(embed_urls)
     media_urls = split.get("media_urls") or []
+    timestamp = cast.get("timestamp") # "timestamp": "2025-08-30T04:55:41.000Z",
     return author_fid, author_username, text, media_urls
 
 
@@ -328,9 +337,12 @@ async def handle_farcaster(event: Dict[str, Any]) -> Session:
     # Get or create user
     user = User.from_farcaster(author_fid, author_username)
 
-    # Todo:
-    # if author_thumbnail != userImage, set useImage
-    
+    # update user metadata
+    pfp = author.get("pfp_url")
+    if pfp and pfp != user.userImage:
+        pfp_url, _ = upload_file_from_url(pfp)
+        user.update(userImage=pfp_url.split("/")[-1])
+
     # get or setup session
     request = PromptSessionRequest(
         user_id=str(user.id),
@@ -349,7 +361,8 @@ async def handle_farcaster(event: Dict[str, Any]) -> Session:
     if media_urls:
         request.message.attachments = media_urls
 
-    session_key = f"farcaster17-{cast_hash}"
+    # session_key = f"farcaster17-{cast_hash}"
+    session_key = f"FC-{thread_hash}"
 
     # attempt to get session by session_key
     try:
@@ -362,7 +375,7 @@ async def handle_farcaster(event: Dict[str, Any]) -> Session:
         request.creation_args = SessionCreationArgs(
             owner_id=str(user.id),
             agents=[str(abraham.id)],
-            title=f"Farcaster test 55",
+            title=f"Farcaster session",
             session_key=session_key,
         )
         session = setup_session(
@@ -376,8 +389,9 @@ async def handle_farcaster(event: Dict[str, Any]) -> Session:
         if thread_hash != cast_hash:
             prev_casts = await fetch_cast_ancestry(cast_hash, include_self=False)
             for pc in prev_casts:
-                author_fid_, author_username_, text_, media_urls_ = await process_cast(pc)
+                author_fid_, author_username_, text_, media_urls_, timestamp_ = await process_cast(pc)
                 media_urls_ = upload_to_s3(media_urls_)
+                created_at = datetime.strptime(timestamp_, "%Y-%m-%dT%H:%M:%S.%fZ")
                 if author_fid_ == TARGET_FID:
                     role = "assistant"
                     cast_user = abraham
@@ -385,6 +399,7 @@ async def handle_farcaster(event: Dict[str, Any]) -> Session:
                     role = "user"
                     cast_user = User.from_farcaster(author_fid_, author_username_)
                 message = ChatMessage(
+                    createdAt=created_at,
                     session=session.id,
                     role=role,
                     content=text_,
@@ -392,8 +407,6 @@ async def handle_farcaster(event: Dict[str, Any]) -> Session:
                     attachments=media_urls_,
                 )
                 message.save()
-                session.messages.append(message.id)
-            session.save()
 
     # Create context with selected model
     context = PromptSessionContext(
@@ -424,35 +437,19 @@ async def handle_farcaster(event: Dict[str, Any]) -> Session:
     return session, new_messages
 
 
-
-
-@fastapi_app.post("/mytesthook")
-async def neynar_webhook(
-    request: Request,
-):
-    print("mytesthook 1 accepted")
-    print(request)
-    print("mytesthook 2 accepted")
-    print(await request.body())
-    print("mytesthook 3 accepted")
-    return JSONResponse({"status": "accepted"}, status_code=200)
-
-
-
 @fastapi_app.post("/neynar/webhook")
 async def neynar_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
     x_neynar_signature: Optional[str] = Header(None),
 ):
-    # --- Signature check ---
+    # --- Validity check ---
+    raw = await request.body()
     if not x_neynar_signature:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing X-Neynar-Signature header")
-    raw = await request.body()
     if not verify_neynar_signature(raw, x_neynar_signature):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signature")
-
-    # --- Parse raw and build a dedupe key before any heavy work ---
+    
     try:
         evt_raw = json.loads(raw.decode("utf-8"))
     except json.JSONDecodeError:
@@ -462,7 +459,7 @@ async def neynar_webhook(
     if evt_raw.get("type") != "cast.created":
         return JSONResponse({"status": "skip.type"}, status_code=200)
 
-    # Normalize (cheap) and do quick routing checks
+    # Normalize and check routes
     event = normalize_cast_event(evt_raw)
 
     parent_fid = event["author"]["fid"]
@@ -479,11 +476,8 @@ async def neynar_webhook(
 
     # --- Offload heavy work; ACK immediately ---
     try:
-        processor = modal.Function.from_name(
-            f"abraham-{os.environ.get('DB','STAGE')}",
-            "process_event",
-        )
-        processor.spawn(event)   # fire-and-forget on Modal infra
+        from modal_app import process_event
+        process_event.spawn(event)   # fire-and-forget on Modal infra
     except Exception as _e:
         # Fallback to in-process background task (keeps webhook snappy)
         background_tasks.add_task(process_event_pipeline, event)
@@ -494,8 +488,3 @@ async def neynar_webhook(
 @fastapi_app.get("/healthz")
 def healthz():
     return {"ok": True}
-
-
-# Note: Modal app definition moved to modal_app.py
-# This file now contains only the business logic functions
-

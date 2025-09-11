@@ -24,6 +24,7 @@ from eve.agent.session.session import add_user_message, build_llm_context, async
 from eve.agent.session.models import Session, PromptSessionContext, ChatMessageRequestInput, ChatMessage, LLMContext, LLMConfig, UpdateType
 
 from eden_utils.compact_messages import compact_messages
+from farcaster2 import FarcasterEvent
 
 
 # Helper functions
@@ -47,7 +48,8 @@ def url_exists(url: str, timeout: int = 5) -> bool:
 
 
 GENESIS_SESSION = None
-NUM_CREATIONS = 4
+
+NUM_CREATIONS = 2
 
 GENESIS_PROMPT = f"""
 Every day you choose {NUM_CREATIONS} ideas for creative projects. These projects span a diversity of forms, including:
@@ -94,10 +96,8 @@ async def handle_drafting(
     user: str = None, 
     agent: str = None
 ) -> Dict[str, Any]:
-    print(f"DEBUG: Received args: {args}")
     results = []
     for creation in args.copy()["creations"]:
-        print(f"DEBUG: Processing creation: {creation}")
         session = await create_session(
             title=creation["title"], 
             proposal=creation["proposal"]
@@ -105,7 +105,7 @@ async def handle_drafting(
         results.append({
             "title": creation["title"],
             "proposal": creation["proposal"],
-            "sessio n_id": str(session.id)
+            "session_id": str(session.id)
         })
 
     return {"output": {"creations": results}}
@@ -176,13 +176,14 @@ async def draft_proposals(genesis_session: str = None):
         context, 
     )
     
-    async for _ in async_prompt_session(session, context, abraham):
+    async for m in async_prompt_session(session, context, abraham):
         pass
     
     return {"genesis_session": genesis_session}
 
 
-INIT_CREATION_TEMPLATE = """The title of your next creation is:
+INIT_CREATION_TEMPLATE = """
+The title of your next creation is:
 {{title}}
 
 The proposal you've made for this creation is:
@@ -242,18 +243,50 @@ async def run_creation_session(
         if update.type == UpdateType.ASSISTANT_MESSAGE:
             new_messages.append(update.message)
 
+    if len(new_messages) == 0:
+        return {
+            "status": "failed", 
+            "session_id": str(session.id), 
+            "error": "No new messages"
+        }
+
     # compact new messages into one
     compact_message = await compact_messages(session, new_messages)
 
     # post the initial result farcaster
-    args = {
+    result = await farcaster_tool.async_run({
         "agent_id": str(abraham.id),
         "text": compact_message.content,
         "embeds": compact_message.media_urls or [],
-    }
-    result = await farcaster_tool.async_run(args)
+    })
 
-    return {"session_id": str(session.id), "result": result}
+    if result.get('status') != 'completed':
+        return {
+            "status": "failed", 
+            "session_id": str(session.id), 
+            "error": result.get('error')
+        }
+
+    # update session key to the hash
+    cast_hash = result.get('output')[0].get('cast_hash')
+    session.session_key = f"FC-{cast_hash}"
+    session.save()
+
+    for output in result.get('output'):
+        event = FarcasterEvent(
+            session_id=session.id,
+            message_id=new_messages[0].id,
+            cast_hash=output.get('cast_hash'),
+            status="completed",
+            event=None
+        )
+        event.save()
+
+    return {
+        "status": "completed", 
+        "session_id": str(session.id), 
+        "result": result
+    }
 
 
 async def create_session(
@@ -269,7 +302,7 @@ async def create_session(
         creation_args=SessionCreationArgs(
             owner_id=str(user.id),
             agents=[str(abraham.id)],
-            title=f"{get_date_prefix()} :: Creation"
+            title=f"{get_date_prefix()} :: Creation",
         )
     )
     
@@ -281,13 +314,9 @@ async def create_session(
         request
     )
     
-    # Run creation session in Modal (remote)
-    import modal
-    processor = modal.Function.from_name(
-        f"abraham-{os.environ.get('DB','STAGE')}",
-        "run_creation",
-    )
-    processor.spawn(
+    # run session remotely
+    from modal_app import run_creation
+    run_creation.spawn(
         session_id=str(session.id),
         title=title,
         proposal=proposal
@@ -295,5 +324,3 @@ async def create_session(
     
     return session
 
-
-# Note: Local entrypoint moved to modal_app.py
