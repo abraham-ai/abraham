@@ -34,11 +34,11 @@ from eve.api.api_requests import PromptSessionRequest, SessionCreationArgs
 from eve.api.handlers import setup_session
 from eve.agent.agent import Agent
 from eve.agent.session.models import (
-    ChatMessage, ChatMessageRequestInput, LLMConfig, 
-    LLMContext, PromptSessionContext, Session, UpdateType
+    ChatMessage, ChatMessageRequestInput, LLMConfig, Channel,
+    LLMContext, PromptSessionContext, Session, UpdateType, SessionUpdateConfig
 )
 from eve.agent.session.session import (
-    add_user_message, 
+    add_chat_message, 
     async_prompt_session, 
     build_llm_context
 )
@@ -108,14 +108,16 @@ class FarcasterEvent(Document):
     reply_cast: Optional[Dict[str, Any]] = None
     reply_fid: Optional[int] = None
 
-# @Collection("farcaster_sessions")
-# class FarcasterSession(Document):
-#     session_id: str = Field(
-#         description="Eden Session ID"
-#     )
-#     cast_hash: str = Field(
-#         description="The result of the session"
-#     )
+
+@Collection("abraham_creations")
+class AbrahamCreation(Document):
+    session_id: ObjectId
+    day: str
+    cast_hash: str
+    title: str
+    description: str
+    status: Literal["active", "closed"]
+
 
 def upload_to_s3(media_urls: List[str]) -> List[str]:
     uploaded_urls = []
@@ -138,6 +140,70 @@ def _split_media(urls: List[str]) -> Dict[str, List[str]]:
         (media if cleaned.endswith(media_exts) or "imagedelivery.net" in u else other).append(u)
     return {"media_urls": media, "other_urls": other}
 
+
+
+def normalize_reaction_event(evt: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize Neynar's reaction webhook into a compact, convenient shape.
+    """
+
+    """
+    {
+    "created_at": 1757778861,
+    "type": "reaction.deleted",
+    "data": {
+        "object": "reaction",
+        "event_timestamp": "2025-09-13T15:54:21.976Z",
+        "timestamp": "2025-09-13T15:54:20.000Z",
+        "reaction_type": 1,
+        "target": {
+            "object": "cast_dehydrated",
+            "hash": "0x226dec859e82d2e0225a7547650f3bd158673599",
+            "author": {
+                "object": "user_dehydrated",
+                "fid": 884285
+            },
+            "parent_hash": "0x45d8c9caf3ff485ffaf9174cbfb8300920b89766",
+            "parent_url": null,
+            "app": {
+                "object": "user_dehydrated",
+                "fid": 9152
+            }
+        },
+        "user": {
+            "object": "user_dehydrated",
+            "fid": 360240,
+            "username": "genekogan",
+            "score": 0.53
+        },
+        "deprecation_notice": "the `cast` field is deprecated and will be removed in the future. Please use the `target` field instead.",
+        "cast": {
+            "object": "cast_dehydrated",
+            "hash": "0x226dec859e82d2e0225a7547650f3bd158673599",
+            "author": {
+                "object": "user_dehydrated",
+                "fid": 884285
+            },
+            "parent_hash": "0x45d8c9caf3ff485ffaf9174cbfb8300920b89766",
+            "parent_url": null,
+            "app": {
+                "object": "user_dehydrated",
+                "fid": 9152
+            }
+        }
+    }
+}
+"""
+
+
+    type_event = evt.get("type")
+    reaction = evt.get("data") or {}
+    target = reaction.get("target") or {}
+    
+
+
+
+    return reaction
 
 def normalize_cast_event(evt: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -228,7 +294,8 @@ def normalize_cast_event(evt: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
-async def process_cast(cast: Dict[str, Any]):
+async def unpack_cast(cast: Dict[str, Any]):
+    cast_hash = cast.get("hash")
     author = cast.get("author") or {}
     author_fid = author.get("fid")
     author_username = author.get("username")
@@ -237,7 +304,7 @@ async def process_cast(cast: Dict[str, Any]):
     split = _split_media(embed_urls)
     media_urls = split.get("media_urls") or []
     timestamp = cast.get("timestamp") # "timestamp": "2025-08-30T04:55:41.000Z",
-    return author_fid, author_username, text, media_urls
+    return cast_hash, author_fid, author_username, text, media_urls, timestamp
 
 
 async def fetch_cast_ancestry(cast_hash: str, include_self: bool = True):
@@ -275,10 +342,17 @@ def is_reply(event: Dict[str, Any], target_fid: int) -> bool:
     return event.get("parent_author_fid") == target_fid
 
 
-async def process_event_pipeline(event: Dict[str, Any]):
+async def process_cast(event: Dict[str, Any]):
     event_doc: Optional[FarcasterEvent] = None
-    try:
-        cast_hash = event["cast"]["hash"]
+    # try:
+    if 1:
+        try:
+            cast_hash = event["cast"]["hash"]
+        except Exception as e:
+            logger.error(f"❌ Error getting cast hash: {str(e)}")
+            logger.error(f"❌ Event: {json.dumps(event, indent=4)}")
+            return
+
         event_doc = FarcasterEvent(
             cast_hash=cast_hash,
             event=event,
@@ -287,48 +361,68 @@ async def process_event_pipeline(event: Dict[str, Any]):
         event_doc.save()
 
         session, new_messages = await handle_farcaster(event)
-        compact_message = await compact_messages(session, new_messages)
 
-        args = {
-            "agent_id": str(abraham.id),
-            "text": compact_message.content,
-            "embeds": compact_message.media_urls or [],
-        }
-        parent_hash = event["cast"]["hash"]
-        parent_fid  = event["author"]["fid"]
-        if parent_hash and parent_fid:
-            args.update({"parent_hash": parent_hash, "parent_fid": parent_fid})
+        print("\n\n\n===================>")
+        print("thehehe response")
+        for m in new_messages:
+            print(m)
+            print("---")
 
-        result = await farcaster_tool.async_run(args)
-        
-        if "output" in result:
-            event_doc.update(
-                status="completed",
-                session_id=session.id,
-                message_id=new_messages[0].id,
-                reply_cast=result.get("output")[0],
-                reply_fid=TARGET_FID,
-            )
-        else:
-            event_doc.update(
-                status="failed",
-                session_id=session.id,
-                message_id=new_messages[0].id,
-                error=str(result.get("error")),
-            )
+        print("session", session.id)
+            
+        # compact_message = await compact_messages(session, new_messages)
 
-    except Exception as e:
-        if event_doc is not None:
-            event_doc.update(status="failed", error=str(e))
-        else:
-            logger.exception("Failed before event_doc creation: %s", e)
+        # args = {
+        #     "agent_id": str(abraham.id),
+        #     "text": compact_message.content,
+        #     "embeds": compact_message.media_urls or [],
+        # }
+        # parent_hash = event["cast"]["hash"]
+        # parent_fid  = event["author"]["fid"]
+        # if parent_hash and parent_fid:
+        #     args.update({"parent_hash": parent_hash, "parent_fid": parent_fid})
+
+        # print("FP 1")
+        # from eve.tools.farcaster.farcaster_cast.handler import handler as farcaster_post
+        # print("FP 2a")
+        # result = await farcaster_post(
+        #     args, 
+        #     user=None,
+        #     agent=str(abraham.id), 
+        #     session=str(session.id)
+        # )
+        # print("FP 2")
+        # print(result)
+        # print("FP 3")
+        # if "output" in result:
+        event_doc.update(
+            status="completed",
+            session_id=session.id,
+            message_id=new_messages[0].id,
+            # reply_cast=None, #result.get("output")[0],
+            reply_fid=TARGET_FID,
+        )
+        # else:
+        #     event_doc.update(
+        #         status="failed",
+        #         session_id=session.id,
+        #         message_id=new_messages[0].id,
+        #         error=str(result.get("error")),
+        #     )
+
+    # except Exception as e:
+    #     if event_doc is not None:
+    #         event_doc.update(status="failed", error=str(e))
+    #     else:
+    #         logger.exception("Failed before event_doc creation: %s", e)
 
 
 async def handle_farcaster(event: Dict[str, Any]) -> Session:
     """Create a session to generate artwork with specified model."""
     cast = event["cast"]
     cast_hash = cast["hash"]
-    thread_hash = cast["thread_hash"]
+    thread_hash = cast.get("thread_hash")
+    parent_hash = cast["parent_hash"]
     content = cast["text"] or ""
     author = event["author"]
     author_username = author["username"]
@@ -336,7 +430,6 @@ async def handle_farcaster(event: Dict[str, Any]) -> Session:
 
     # Get or create user
     user = User.from_farcaster(author_fid, author_username)
-
     # update user metadata
     pfp = author.get("pfp_url")
     if pfp and pfp != user.userImage:
@@ -361,8 +454,19 @@ async def handle_farcaster(event: Dict[str, Any]) -> Session:
     if media_urls:
         request.message.attachments = media_urls
 
+
+
+    # who is actually the paying user (insuf manna)
+    # session_id='None-68e75a27e96b2dffb8f3f5fd'
+
+
     # session_key = f"farcaster17-{cast_hash}"
-    session_key = f"FC-{thread_hash}"
+    if thread_hash:
+        session_key = f"FC-{thread_hash}"
+    else:
+        session_key = f"FC-{cast_hash}"
+
+    print("- -- > session_key", session_key)
 
     # attempt to get session by session_key
     try:
@@ -385,11 +489,16 @@ async def handle_farcaster(event: Dict[str, Any]) -> Session:
             request
         )
 
+        print("\n\n\n\n\n============")
+        print(thread_hash, cast_hash, parent_hash, session.id)
+        print("============")
+
+
         # if the cast is not the original, get the previous casts and add them to the session
         if thread_hash != cast_hash:
             prev_casts = await fetch_cast_ancestry(cast_hash, include_self=False)
             for pc in prev_casts:
-                author_fid_, author_username_, text_, media_urls_, timestamp_ = await process_cast(pc)
+                cast_hash_, author_fid_, author_username_, text_, media_urls_, timestamp_ = await unpack_cast(pc)
                 media_urls_ = upload_to_s3(media_urls_)
                 created_at = datetime.strptime(timestamp_, "%Y-%m-%dT%H:%M:%S.%fZ")
                 if author_fid_ == TARGET_FID:
@@ -401,24 +510,30 @@ async def handle_farcaster(event: Dict[str, Any]) -> Session:
                 message = ChatMessage(
                     createdAt=created_at,
                     session=session.id,
+                    channel=Channel(type="farcaster", key=cast_hash_),
                     role=role,
                     content=text_,
                     sender=cast_user.id,
                     attachments=media_urls_,
                 )
                 message.save()
-
+    
     # Create context with selected model
     context = PromptSessionContext(
         session=session,
         initiating_user_id=request.user_id,
         message=request.message,
-        llm_config=LLMConfig(model="claude-sonnet-4-20250514")
+        update_config=SessionUpdateConfig(
+            farcaster_hash=cast_hash,
+            farcaster_author_fid=author_fid,
+        ),
+        llm_config=LLMConfig(model="claude-sonnet-4-5"),
+        extra_tools={farcaster_tool.name: farcaster_tool}
     )
 
     # Add user message to session
-    add_user_message(session, context)
-    
+    await add_chat_message(session, context)
+
     # Build LLM context
     context = await build_llm_context(
         session, 
@@ -426,14 +541,12 @@ async def handle_farcaster(event: Dict[str, Any]) -> Session:
         context, 
         trace_id=str(uuid.uuid4()), 
     )
-
     new_messages = []
     
     # Execute the prompt session
     async for update in async_prompt_session(session, context, abraham):
         if update.type == UpdateType.ASSISTANT_MESSAGE:
             new_messages.append(update.message)
-
     return session, new_messages
 
 
@@ -445,6 +558,7 @@ async def neynar_webhook(
 ):
     # --- Validity check ---
     raw = await request.body()
+
     if not x_neynar_signature:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing X-Neynar-Signature header")
     if not verify_neynar_signature(raw, x_neynar_signature):
@@ -456,35 +570,158 @@ async def neynar_webhook(
         return JSONResponse({"status": "error", "message": "Invalid JSON body"}, status_code=200)
 
     # If not cast.created, just ack and stop early
-    if evt_raw.get("type") != "cast.created":
+    evt_type = evt_raw.get("type")
+    if evt_type not in [
+        "cast.created", 
+        "reaction.created", 
+        "reaction.deleted"
+    ]:
         return JSONResponse({"status": "skip.type"}, status_code=200)
 
-    # Normalize and check routes
-    event = normalize_cast_event(evt_raw)
+    if evt_type in ["reaction.created", "reaction.deleted"]:
+        event = normalize_reaction_event(evt_raw)
 
-    parent_fid = event["author"]["fid"]
-    if parent_fid == TARGET_FID:
-        return JSONResponse({"status": "skip.self"}, status_code=200)
+    else:
+        # Normalize and check routes
+        event = normalize_cast_event(evt_raw)
 
-    if not (is_reply(event, TARGET_FID) or is_mention(event, TARGET_FID)):
-        return JSONResponse({"status": "skip.not_relevant"}, status_code=200)
+        print("GOT A PARENT FID")
+        print(event["author"]["fid"])
+        print("============")
+        print(TARGET_FID)
+        print(type(TARGET_FID), type(event["author"]["fid"]))
+        print("============")
 
-    # de-dupe
-    cast_hash = event["cast"]["hash"]
-    if FarcasterEvent.find_one({"cast_hash": cast_hash}):
-        return JSONResponse({"status": "duplicate_ignored"}, status_code=200)
+        parent_fid = event["author"]["fid"]
+        if parent_fid == TARGET_FID:
+            return JSONResponse({"status": "skip.self"}, status_code=200)
+
+        if not (is_reply(event, TARGET_FID) or is_mention(event, TARGET_FID)):
+            return JSONResponse({"status": "skip.not_relevant"}, status_code=200)
+
+        # de-dupe
+        cast_hash = event["cast"]["hash"]
+        print("GOT A CAST HASH")
+        print(cast_hash)
+        print("============")
+        if FarcasterEvent.find_one({"cast_hash": cast_hash}):
+            return JSONResponse({"status": "duplicate_ignored"}, status_code=200)
 
     # --- Offload heavy work; ACK immediately ---
-    try:
+    if 1:
         from modal_app import process_event
         process_event.spawn(event)   # fire-and-forget on Modal infra
-    except Exception as _e:
-        # Fallback to in-process background task (keeps webhook snappy)
-        background_tasks.add_task(process_event_pipeline, event)
-
+    else:
+        await process_cast(event)
+    
     return JSONResponse({"status": "accepted"}, status_code=200)
 
 
 @fastapi_app.get("/healthz")
 def healthz():
     return {"ok": True}
+
+
+
+# evt_raw = {
+#     "created_at": 1759983454,
+#     "type": "cast.created",
+#     "data": {
+#         "object": "cast",
+#         "hash": "0x4bc7f2dd495ef182e4a558b607b05a5c98caf7ad",
+#         "author": {
+#             "object": "user",
+#             "fid": 360240,
+#             "username": "genekogan",
+#             "display_name": "Gene Kogan",
+#             "pfp_url": "https://imagedelivery.net/BXluQx4ige9GuW0Ia56BHw/36696a0b-7e67-409a-58fb-74e288c6f200/original",
+#             "custody_address": "0x364db42663270e039b4b7c68e4f2caef8267a557",
+#             "profile": {
+#                 "bio": {
+#                     "text": "programmer, primate"
+#                 }
+#             },
+#             "follower_count": 35,
+#             "following_count": 80,
+#             "verifications": [
+#                 "0x2eabc4a0bf73dbec9f9b53695cb42333f8f13f8f"
+#             ],
+#             "verified_addresses": {
+#                 "eth_addresses": [
+#                     "0x2eabc4a0bf73dbec9f9b53695cb42333f8f13f8f"
+#                 ],
+#                 "sol_addresses": [
+#                     "hGt3T6LdcxRaZrqVbq5bXL7rdSxHae3zGKen3e3hvM3"
+#                 ],
+#                 "primary": {
+#                     "eth_address": "0x2eabc4a0bf73dbec9f9b53695cb42333f8f13f8f",
+#                     "sol_address": "hGt3T6LdcxRaZrqVbq5bXL7rdSxHae3zGKen3e3hvM3"
+#                 }
+#             },
+#             "auth_addresses": [
+#                 {
+#                     "address": "0x2eabc4a0bf73dbec9f9b53695cb42333f8f13f8f",
+#                     "app": {
+#                         "object": "user_dehydrated",
+#                         "fid": 9152
+#                     }
+#                 }
+#             ],
+#             "verified_accounts": [
+#                 {
+#                     "platform": "x",
+#                     "username": "genekogan"
+#                 }
+#             ],
+#             "power_badge": False,
+#             "experimental": {
+#                 "neynar_user_score": 0.42,
+#                 "deprecation_notice": "The `neynar_user_score` field under `experimental` will be deprecated after June 1, 2025, as it will be formally promoted to a stable field named `score` within the user object."
+#             },
+#             "score": 0.42
+#         },
+#         "app": {
+#             "object": "user_dehydrated",
+#             "fid": 9152,
+#             "username": "warpcast",
+#             "display_name": "Warpcast",
+#             "pfp_url": "https://i.imgur.com/3d6fFAI.png",
+#             "custody_address": "0x02ef790dd7993a35fd847c053eddae940d055596"
+#         },
+#         "thread_hash": "0xfa9c7c17972b0a2598b83a128d328e5af6c6f640",
+#         "parent_hash": "0xfa9c7c17972b0a2598b83a128d328e5af6c6f640",
+#         "parent_url": None,
+#         "root_parent_url": None,
+#         "parent_author": {
+#             "fid": 884285
+#         },
+#         "text": "say that initalian",
+#         "timestamp": "2025-10-09T04:17:31.000Z",
+#         "embeds": [],
+#         "channel": None,
+#         "reactions": {
+#             "likes_count": 0,
+#             "recasts_count": 0,
+#             "likes": [],
+#             "recasts": []
+#         },
+#         "replies": {
+#             "count": 0
+#         },
+#         "mentioned_profiles": [],
+#         "mentioned_profiles_ranges": [],
+#         "mentioned_channels": [],
+#         "mentioned_channels_ranges": [],
+#         "event_timestamp": "2025-10-09T04:17:34.138Z"
+#     }
+# }
+
+# async def test_evt_without_server():
+#     event = normalize_cast_event(evt_raw)
+#     await process_cast(event)
+
+
+# if __name__ == "__main__":
+#     import asyncio
+#     print("---> test_evt_without_server 1")
+#     asyncio.run(test_evt_without_server())

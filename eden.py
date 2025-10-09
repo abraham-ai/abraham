@@ -25,7 +25,7 @@ from eve.agent.session.models import (
     LLMContext, PromptSessionContext, Session
 )
 from eve.agent.session.session import (
-    add_user_message, 
+    add_chat_message, 
     async_prompt_session, 
     build_llm_context
 )
@@ -305,7 +305,7 @@ async def create_session(
     )
     
     # Add user message to session
-    add_user_message(session, context)
+    await add_chat_message(session, context)
     
     # Build LLM context
     context = await build_llm_context(
@@ -449,7 +449,7 @@ async def process_blessings_iteration(
     )
     
     # Add user message to session
-    user_message = add_user_message(session, context)
+    user_message = await add_chat_message(session, context)
     
     # Build LLM context
     context = await build_llm_context(
@@ -515,7 +515,7 @@ async def close_session(
     )
 
     # Add user message to session
-    add_user_message(session, context)
+    await add_chat_message(session, context)
 
     # Build LLM context
     context = await build_llm_context(
@@ -590,7 +590,7 @@ async def create_video(
         )
         
         # Add user message to session
-        add_user_message(session, context)
+        await add_chat_message(session, context)
         
         # Build LLM context
         context = await build_llm_context(

@@ -5,7 +5,7 @@ import json
 import uuid
 import modal
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Literal
 from bson import ObjectId
 from jinja2 import Template
@@ -20,11 +20,11 @@ from eve.api.api_requests import PromptSessionRequest, SessionCreationArgs
 from eve.api.handlers import setup_session
 from eve.agent.session.session_llm import async_prompt
 from eve.agent.session.session_prompts import system_template
-from eve.agent.session.session import add_user_message, build_llm_context, async_prompt_session
+from eve.agent.session.session import add_chat_message, build_llm_context, async_prompt_session
 from eve.agent.session.models import Session, PromptSessionContext, ChatMessageRequestInput, ChatMessage, LLMContext, LLMConfig, UpdateType
 
 from eden_utils.compact_messages import compact_messages
-from farcaster2 import FarcasterEvent
+from farcaster2 import FarcasterEvent, AbrahamCreation
 
 
 # Helper functions
@@ -47,9 +47,7 @@ def url_exists(url: str, timeout: int = 5) -> bool:
         return False
 
 
-GENESIS_SESSION = None
-
-NUM_CREATIONS = 2
+NUM_CREATIONS = 8
 
 GENESIS_PROMPT = f"""
 Every day you choose {NUM_CREATIONS} ideas for creative projects. These projects span a diversity of forms, including:
@@ -71,6 +69,22 @@ Draft your first set of {NUM_CREATIONS} project proposals, using the ProjectProp
 NEXT_DRAFTING_PROMPT = f"""
 Draft a new set of {NUM_CREATIONS} project proposals, using the ProjectProposals tool, which are different from your previous ones, but subtly influenced by your most recent learnings from your followers. Try to channel their preferences, suggestions, and affirmations, and attenuate the characteristics of your work they disfavor. Use the tool once -- do not elaborate on the results.
 """
+
+NEXT_DRAFTING_PROMPT_TEMPLATE = """
+The following results are the previous day's proposals, sorted by activity from most to least. They are suggestive of the topics, themes, and ideas most interesting to your followers.
+
+<yesterday_proposals>
+{{yesterday_results}}
+</yesterday_proposals>
+
+Given yesterday's learnings, draft a **new** set of {{num_creations}} project proposals, using the ProjectProposals tool, which are different from your previous ones, but subtly influenced by your most recent learnings from your followers. 
+
+* Try not to repeat yourself or make proposals too similar to yesterday's. Be creative.
+* Try to channel their preferences in a subtle way. Don't copy the winning creations, but rather distill abstract properties of them which appeal to your supporters, and subtly incorporate them into the new proposals. Attenuate the characteristics of your work they disfavor or do not react to.
+* Use the tool once -- do not elaborate on the results or produce new ones.
+"""
+
+
 
 
 class ProjectProposal(BaseModel):
@@ -97,6 +111,7 @@ async def handle_drafting(
     agent: str = None
 ) -> Dict[str, Any]:
     results = []
+    
     for creation in args.copy()["creations"]:
         session = await create_session(
             title=creation["title"], 
@@ -113,6 +128,10 @@ async def handle_drafting(
 
 async def draft_proposals(genesis_session: str = None):
     # Initialize globals
+    genesis_session = str("68cac5f94750193ce8f59a35")
+    print("draft_proposals, session", genesis_session)
+    print("--------------------------------")
+
     user = get_my_eden_user()
     abraham = Agent.load("abraham")
     
@@ -122,12 +141,8 @@ async def draft_proposals(genesis_session: str = None):
         handle_drafting
     )
 
-    next_drafting_prompt = NEXT_DRAFTING_PROMPT
-
-    # create genesis session if not set
+    # create genesis session if new
     if genesis_session is None:
-        next_drafting_prompt = NEXT_DRAFTING_PROMPT_INIT
-
         request = PromptSessionRequest(
             user_id=str(user.id),
             creation_args=SessionCreationArgs(
@@ -150,11 +165,38 @@ async def draft_proposals(genesis_session: str = None):
             session=session,
             initiating_user_id=request.user_id,
             message=message,
-            llm_config=LLMConfig(model="claude-sonnet-4-20250514")
+            llm_config=LLMConfig(model="claude-sonnet-4-5")
         )
-        add_user_message(session, context)        
+        await add_chat_message(session, context)        
+
         genesis_session = str(session.id)
+        next_drafting_prompt = NEXT_DRAFTING_PROMPT_INIT
         
+    # if it's not the first drafting, let's extract learnings from the previous session
+    else:
+        yesterday = (datetime.now(pytz.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        yesterday_creations = AbrahamCreation.find({"day": yesterday})
+        creation_results = []
+        for creation in yesterday_creations:
+            session = Session.from_mongo(creation.session_id)
+            messages = session.get_messages()
+            num_messages = len(messages)
+            creation_results.append({
+                "session_id": str(session.id),
+                "title": creation.title,
+                "num_messages": len(messages) - 5,
+            })
+
+        sorted_data = sorted(creation_results, key=lambda x: x['num_messages'], reverse=True)
+        yesterday_results = ""
+        for item in sorted_data:
+            yesterday_results += f"* {item['num_messages']:2d} messages: {item['title']}\n"
+
+        next_drafting_prompt = Template(NEXT_DRAFTING_PROMPT_TEMPLATE).render(
+            yesterday_results=yesterday_results,
+            num_creations=NUM_CREATIONS
+        )
+
     # make a new set of drafts
     session = Session.from_mongo(genesis_session)
     message = ChatMessageRequestInput(
@@ -165,10 +207,10 @@ async def draft_proposals(genesis_session: str = None):
         session=session,
         initiating_user_id=str(user.id),
         message=message,
-        llm_config=LLMConfig(model="claude-sonnet-4-20250514"),
+        llm_config=LLMConfig(model="claude-sonnet-4-5"),
         custom_tools={custom_tool.key: custom_tool},
     )
-    add_user_message(session, context)
+    await add_chat_message(session, context)
 
     context = await build_llm_context(
         session, 
@@ -203,6 +245,9 @@ async def run_creation_session(
     abraham = Agent.load("abraham")
     farcaster_tool = Tool.load("farcaster_cast")
     
+    # today tag
+    today = datetime.now(pytz.utc).strftime("%Y-%m-%d")
+
     # Load session from ID
     session = Session.from_mongo(session_id)
     
@@ -221,11 +266,11 @@ async def run_creation_session(
         session=session,
         initiating_user_id=str(session.owner),
         message=message,
-        llm_config=LLMConfig(model="claude-sonnet-4-20250514")
+        llm_config=LLMConfig(model="claude-sonnet-4-5")
     )
     
     # Add user message to session
-    add_user_message(session, context)
+    await add_chat_message(session, context)
     
     # Build LLM context
     context = await build_llm_context(
@@ -272,6 +317,7 @@ async def run_creation_session(
     session.session_key = f"FC-{cast_hash}"
     session.save()
 
+    # save casts as farcaster events
     for output in result.get('output'):
         event = FarcasterEvent(
             session_id=session.id,
@@ -281,6 +327,17 @@ async def run_creation_session(
             event=None
         )
         event.save()
+
+    # add new session to creations collection
+    creation = AbrahamCreation(
+        session_id=session.id,
+        day=today,
+        cast_hash=cast_hash,
+        title=title,
+        description=proposal,
+        status="active"
+    )
+    creation.save()
 
     return {
         "status": "completed", 

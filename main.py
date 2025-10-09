@@ -482,4 +482,13 @@ def local():
     asyncio.run(update())
 
 if __name__ == "__main__":
-    asyncio.run(local())
+    # asyncio.run(local())
+    print("hello")
+    tournament.create_session(
+        session_id=str(ObjectId()),
+        message_id=str(ObjectId()),
+        created_at=datetime.now(),
+        content="This is a test of the tournamet create object",
+        media="https://edenartlab-prod-data.s3.us-east-1.amazonaws.com/bb88e857586a358ce3f02f92911588207fbddeabff62a3d6a479517a646f053c.jpg"
+    )
+    print("done")

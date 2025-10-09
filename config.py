@@ -9,7 +9,7 @@ load_dotenv()
 DEBUG                 = os.getenv("DEBUG", "False").lower() == "true"
 APP_NAME              = "abraham"
 GENERATION_COUNT      = 8
-MODEL_NAME            = "claude-sonnet-4-20250514"
+MODEL_NAME            = "claude-sonnet-4-5"
 FALLBACK_MODEL_NAME   = "gpt-4o"
 MAX_PARALLEL_WORKERS  = 4
 MAX_CREATION_RETRIES  = 3

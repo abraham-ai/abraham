@@ -57,7 +57,7 @@ async def compact_messages(session: Session, new_messages: List[ChatMessage]) ->
             ChatMessage(role="system", content=instruction)
         ],
         config=LLMConfig(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5",
             response_format=CompactMessage
         )
     )

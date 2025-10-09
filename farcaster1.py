@@ -38,7 +38,7 @@ from eve.agent.session.models import (
     LLMContext, PromptSessionContext, Session
 )
 from eve.agent.session.session import (
-    add_user_message, 
+    add_chat_message, 
     async_prompt_session, 
     build_llm_context
 )
@@ -404,11 +404,11 @@ async def handle_farcaster(
         session=session,
         initiating_user_id=request.user_id,
         message=request.message,
-        llm_config=LLMConfig(model="claude-sonnet-4-20250514")
+        llm_config=LLMConfig(model="claude-sonnet-4-5")
     )
 
     # Add user message to session
-    add_user_message(session, context)
+    await add_chat_message(session, context)
     
     # Build LLM context
     context = await build_llm_context(
@@ -478,7 +478,7 @@ async def compact_messages(
             ChatMessage(role="system", content=instruction)
         ],
         config=LLMConfig(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5",
             response_format=CompactMessage
         )
     )

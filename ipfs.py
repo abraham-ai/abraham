@@ -39,7 +39,8 @@ def pin(data: Union[str, Mapping[str, Any]]) -> str:
     file_endpoint = f"{IPFS_BASE_URL}/pinning/pinFileToIPFS"
     auth_headers = {"Authorization": f"Bearer {PINATA_JWT}"}
 
-    try:
+    # try:
+    if 1:
         # JSON blob
         if isinstance(data, Mapping):
             url = f"{IPFS_BASE_URL}/pinning/pinJSONToIPFS"
@@ -85,8 +86,8 @@ def pin(data: Union[str, Mapping[str, Any]]) -> str:
         logger.info(f"Uploaded to IPFS: {url}")        
         return ipfs_hash
         
-    except requests.RequestException as e:
-        raise IPFSError(f"Network error during IPFS upload: {e}")
+    # except requests.RequestException as e:
+    #     raise IPFSError(f"Network error during IPFS upload: {e}")
 
-    except Exception as e:
-        raise IPFSError(f"IPFS upload error: {e}")
+    # except Exception as e:
+    #     raise IPFSError(f"IPFS upload error: {e}")
