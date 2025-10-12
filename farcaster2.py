@@ -344,14 +344,17 @@ def is_reply(event: Dict[str, Any], target_fid: int) -> bool:
 
 async def process_cast(event: Dict[str, Any]):
     event_doc: Optional[FarcasterEvent] = None
-    # try:
-    if 1:
+    try:
+    # if 1:
+        print("PROCESSING CAST")
         try:
             cast_hash = event["cast"]["hash"]
         except Exception as e:
             logger.error(f"❌ Error getting cast hash: {str(e)}")
             logger.error(f"❌ Event: {json.dumps(event, indent=4)}")
             return
+
+        print("CREATING EVENT DOC", cast_hash)
 
         event_doc = FarcasterEvent(
             cast_hash=cast_hash,
@@ -360,13 +363,10 @@ async def process_cast(event: Dict[str, Any]):
         )
         event_doc.save()
 
-        session, new_messages = await handle_farcaster(event)
+        print("even doc saved", event_doc.id)
+        print("... handle farcaster")
 
-        print("\n\n\n===================>")
-        print("thehehe response")
-        for m in new_messages:
-            print(m)
-            print("---")
+        session, new_messages = await handle_farcaster(event)
 
         print("session", session.id)
             
@@ -402,6 +402,7 @@ async def process_cast(event: Dict[str, Any]):
             # reply_cast=None, #result.get("output")[0],
             reply_fid=TARGET_FID,
         )
+        print("COMPLETED EVENT DOC")
         # else:
         #     event_doc.update(
         #         status="failed",
@@ -410,31 +411,48 @@ async def process_cast(event: Dict[str, Any]):
         #         error=str(result.get("error")),
         #     )
 
-    # except Exception as e:
-    #     if event_doc is not None:
-    #         event_doc.update(status="failed", error=str(e))
-    #     else:
-    #         logger.exception("Failed before event_doc creation: %s", e)
+    except Exception as e:
+        print("FAILED EVENT", e)
+        if event_doc is not None:
+            print("FAILED EVENT DOC")
+            event_doc.update(status="failed", error=str(e))
+        else:
+            print("FAILED BEFORE EVENT DOC CREATION")
+            logger.exception("Failed before event_doc creation: %s", e)
+
+
+async def induct_user(user: User, author: Dict[str, Any]):
+    # update user metadata
+    pfp = author.get("pfp_url")
+    print("PFP", pfp)
+    print("USER IMAGE", user.userImage)
+    if pfp and pfp != user.userImage:
+        try:
+            pfp_url, _ = upload_file_from_url(pfp)
+            user.update(userImage=pfp_url.split("/")[-1])
+        except Exception as e:
+            logger.error(f"❌ Error uploading pfp {pfp} for user {str(user.id)}: {str(e)}")
+            return
 
 
 async def handle_farcaster(event: Dict[str, Any]) -> Session:
     """Create a session to generate artwork with specified model."""
+    print("HANDLING FARCaster....")
+    import json
+    print(json.dumps(event, indent=4))
     cast = event["cast"]
     cast_hash = cast["hash"]
     thread_hash = cast.get("thread_hash")
     parent_hash = cast["parent_hash"]
-    content = cast["text"] or ""
+    content = cast.get("text") or ""
     author = event["author"]
     author_username = author["username"]
     author_fid = author["fid"]
 
     # Get or create user
     user = User.from_farcaster(author_fid, author_username)
-    # update user metadata
-    pfp = author.get("pfp_url")
-    if pfp and pfp != user.userImage:
-        pfp_url, _ = upload_file_from_url(pfp)
-        user.update(userImage=pfp_url.split("/")[-1])
+    await induct_user(user, author)
+    print("INDUCTED USER", user.id)
 
     # get or setup session
     request = PromptSessionRequest(
@@ -594,9 +612,11 @@ async def neynar_webhook(
 
         parent_fid = event["author"]["fid"]
         if parent_fid == TARGET_FID:
+            print("SKIP SELF")
             return JSONResponse({"status": "skip.self"}, status_code=200)
 
         if not (is_reply(event, TARGET_FID) or is_mention(event, TARGET_FID)):
+            print("SKIP, NOT RELEVANT")
             return JSONResponse({"status": "skip.not_relevant"}, status_code=200)
 
         # de-dupe
@@ -605,13 +625,16 @@ async def neynar_webhook(
         print(cast_hash)
         print("============")
         if FarcasterEvent.find_one({"cast_hash": cast_hash}):
+            print("DUPLICATE IGNORED")
             return JSONResponse({"status": "duplicate_ignored"}, status_code=200)
 
     # --- Offload heavy work; ACK immediately ---
     if 1:
+        print("SPAWNING EVENT")
         from modal_app import process_event
         process_event.spawn(event)   # fire-and-forget on Modal infra
     else:
+        print("PROCESSING EVENT")
         await process_cast(event)
     
     return JSONResponse({"status": "accepted"}, status_code=200)

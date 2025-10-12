@@ -1,5 +1,8 @@
 import json
 import time
+import os
+import requests
+from enum import Enum
 from typing import Optional, Tuple, Dict, Any
 
 from web3 import Web3
@@ -10,9 +13,15 @@ from eth_utils import to_text
 from config import (
     logger,
     BASE_SEPOLIA_RPC,
+    ETH_SEPOLIA_RPC,
     PRIVATE_KEY,
     CHAIN_ID,
 )
+
+class Network(Enum):
+    BASE_SEPOLIA = "base_sepolia"
+    ETH_SEPOLIA = "eth_sepolia"
+
 
 # ---------- Errors ----------
 
@@ -31,10 +40,14 @@ def _explorer_url(tx_hash_hex: str) -> str:
     return f"https://sepolia.basescan.org/tx/{tx_hash_hex}"
 
 
-def make_w3() -> Web3:
-    w3 = Web3(Web3.HTTPProvider(BASE_SEPOLIA_RPC, request_kwargs={"timeout": 60}))
-    if not w3.is_connected():
-        raise BlockchainError("Web3 connection failed")
+def make_w3(network: Network = Network.BASE_SEPOLIA) -> Web3:
+    rpc = BASE_SEPOLIA_RPC if network == Network.BASE_SEPOLIA else ETH_SEPOLIA_RPC
+    print("RPC", rpc)
+    w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 60}))
+    print("W3", w3)
+    print("W3 is connected", w3.is_connected())
+    # if not w3.is_connected():
+    #     raise BlockchainError("Web3 connection failed")
     return w3
 
 
@@ -89,6 +102,66 @@ def suggest_fees(
 
     return {"maxFeePerGas": max_fee, "maxPriorityFeePerGas": prio}
 
+def decode_custom_error(error_data: str, abi: list) -> str:
+    """
+    Decode a custom Solidity error from hex data.
+    Returns a human-readable error message with decoded parameters.
+    """
+    if isinstance(error_data, tuple):
+        error_data = error_data[0]
+
+    # Extract selector (first 4 bytes / 8 hex chars after 0x)
+    selector = error_data[:10]
+    params_data = error_data[10:]
+
+    # Find matching error in ABI
+    errors = [item for item in abi if item.get('type') == 'error']
+
+    for error in errors:
+        name = error['name']
+        inputs = error.get('inputs', [])
+
+        # Build signature and calculate selector
+        if inputs:
+            param_types = ','.join(inp['type'] for inp in inputs)
+            signature = f'{name}({param_types})'
+        else:
+            signature = f'{name}()'
+
+        calc_selector = '0x' + Web3.keccak(text=signature).hex()[:8]
+
+        if calc_selector == selector:
+            # Decode parameters if any
+            if inputs and params_data:
+                try:
+                    param_bytes = bytes.fromhex(params_data)
+                    decoded_params = []
+
+                    for i, inp in enumerate(inputs):
+                        param_type = inp['type']
+                        param_name = inp.get('name', f'param{i}')
+
+                        if param_type == 'address':
+                            offset = i * 32
+                            addr_bytes = param_bytes[offset:offset+32]
+                            address = '0x' + addr_bytes[-20:].hex()
+                            decoded_params.append(f'{param_name}={address}')
+                        elif param_type.startswith('uint'):
+                            offset = i * 32
+                            value = int.from_bytes(param_bytes[offset:offset+32], 'big')
+                            decoded_params.append(f'{param_name}={value}')
+                        else:
+                            decoded_params.append(f'{param_name}=<{param_type}>')
+
+                    return f'{name}({", ".join(decoded_params)})'
+                except Exception:
+                    return signature
+            else:
+                return f'{name}()'
+
+    # Unknown error
+    return f'Unknown error {selector}'
+
 def _extract_revert_msg(err_dict: Dict[str, Any]) -> str:
     data = err_dict.get("data")
     if isinstance(data, str) and data.startswith("0x08c379a0"):  # Error(string)
@@ -106,16 +179,26 @@ def simulate_call(
     contract_function,
     from_address: str,
     value: int = 0,
+    abi: Optional[list] = None,
 ) -> None:
     """
     Run a dry call to surface reverts pre-broadcast.
+    If abi is provided, will decode custom errors for better error messages.
     """
     try:
         # Call with only essentials; don't pass gas/fees to avoid masking errors.
         contract_function.call({"from": from_address, "value": value})
     except ContractLogicError as e:
-        # Most useful error for devs
-        raise BlockchainError(f"Simulation reverted: {e}") from e
+        # Try to decode custom error if ABI provided
+        error_msg = str(e)
+        if abi and hasattr(e, 'args') and e.args:
+            try:
+                error_data = e.args[0] if isinstance(e.args[0], str) else str(e.args[0])
+                decoded = decode_custom_error(error_data, abi)
+                error_msg = decoded
+            except Exception:
+                pass  # Fall back to original error message
+        raise BlockchainError(f"Simulation reverted: {error_msg}") from e
     except ValueError as e:
         msg = _extract_revert_msg(e.args[0]) if e.args and isinstance(e.args[0], dict) else str(e)
         raise BlockchainError(f"Simulation failed: {msg}") from e
@@ -188,6 +271,7 @@ def safe_send(
     urgency: str = "fast",
     speed_up_on_timeout: bool = True,
     speed_up_bump: float = 1.125,  # 12.5% bump when replacing
+    abi: Optional[list] = None,  # Added to decode custom errors
 ) -> Tuple[bytes, Any]:
     """
     1) simulate, 2) estimate gas, 3) build+sign+send (EIP-1559 if available), 4) wait N confirmations.
@@ -196,7 +280,7 @@ def safe_send(
     addr = owner_account.address
 
     # ---- 1) simulate
-    simulate_call(contract_function, addr, value=value)
+    simulate_call(contract_function, addr, value=value, abi=abi)
 
     # ---- 2) nonce + gas + fees
     use_nonce = resolve_nonce(w3, addr, nonce)
@@ -337,18 +421,20 @@ def safe_send(
 
 def load_contract(
     address: str,
-    abi_path: str
+    abi_path: str,
+    network: Network = Network.BASE_SEPOLIA
 ):
     """
     Loads a contract from an address and ABI.
+    Returns: (w3, owner, contract, abi)
     """
 
     # Load ABI
     with open(abi_path, "r") as f:
         abi = json.load(f)
 
-    w3 = make_w3()
+    w3 = make_w3(network)
     owner = Account.from_key(PRIVATE_KEY)
     contract = w3.eth.contract(address=address, abi=abi)
-    
-    return w3, owner, contract
+
+    return w3, owner, contract, abi
