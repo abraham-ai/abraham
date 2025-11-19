@@ -15,8 +15,8 @@ from config import (
     BASE_SEPOLIA_RPC,
     ETH_SEPOLIA_RPC,
     PRIVATE_KEY,
-    CHAIN_ID,
 )
+
 
 class Network(Enum):
     BASE_SEPOLIA = "base_sepolia"
@@ -42,12 +42,9 @@ def _explorer_url(tx_hash_hex: str) -> str:
 
 def make_w3(network: Network = Network.BASE_SEPOLIA) -> Web3:
     rpc = BASE_SEPOLIA_RPC if network == Network.BASE_SEPOLIA else ETH_SEPOLIA_RPC
-    print("RPC", rpc)
     w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 60}))
-    print("W3", w3)
-    print("W3 is connected", w3.is_connected())
-    # if not w3.is_connected():
-    #     raise BlockchainError("Web3 connection failed")
+    if not w3.is_connected():
+        raise BlockchainError("Web3 connection failed")
     return w3
 
 
@@ -305,7 +302,7 @@ def safe_send(
 
     # ---- 3) build + sign + send
     common_fields = {
-        "chainId": CHAIN_ID or w3.eth.chain_id,
+        "chainId": w3.eth.chain_id,
         "from": addr,
         "nonce": use_nonce,
         "gas": gas_limit,

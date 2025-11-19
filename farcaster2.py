@@ -109,14 +109,14 @@ class FarcasterEvent(Document):
     reply_fid: Optional[int] = None
 
 
-@Collection("abraham_creations")
-class AbrahamCreation(Document):
-    session_id: ObjectId
-    day: str
-    cast_hash: str
-    title: str
-    description: str
-    status: Literal["active", "closed"]
+# @Collection("abraham_creations")
+# class AbrahamCreation(Document):
+#     session_id: ObjectId
+#     day: str
+#     cast_hash: str
+#     title: str
+#     description: str
+#     status: Literal["active", "closed"]
 
 
 def upload_to_s3(media_urls: List[str]) -> List[str]:
@@ -345,16 +345,12 @@ def is_reply(event: Dict[str, Any], target_fid: int) -> bool:
 async def process_cast(event: Dict[str, Any]):
     event_doc: Optional[FarcasterEvent] = None
     try:
-    # if 1:
-        print("PROCESSING CAST")
         try:
             cast_hash = event["cast"]["hash"]
         except Exception as e:
             logger.error(f"❌ Error getting cast hash: {str(e)}")
             logger.error(f"❌ Event: {json.dumps(event, indent=4)}")
             return
-
-        print("CREATING EVENT DOC", cast_hash)
 
         event_doc = FarcasterEvent(
             cast_hash=cast_hash,
@@ -363,38 +359,8 @@ async def process_cast(event: Dict[str, Any]):
         )
         event_doc.save()
 
-        print("even doc saved", event_doc.id)
-        print("... handle farcaster")
-
         session, new_messages = await handle_farcaster(event)
 
-        print("session", session.id)
-            
-        # compact_message = await compact_messages(session, new_messages)
-
-        # args = {
-        #     "agent_id": str(abraham.id),
-        #     "text": compact_message.content,
-        #     "embeds": compact_message.media_urls or [],
-        # }
-        # parent_hash = event["cast"]["hash"]
-        # parent_fid  = event["author"]["fid"]
-        # if parent_hash and parent_fid:
-        #     args.update({"parent_hash": parent_hash, "parent_fid": parent_fid})
-
-        # print("FP 1")
-        # from eve.tools.farcaster.farcaster_cast.handler import handler as farcaster_post
-        # print("FP 2a")
-        # result = await farcaster_post(
-        #     args, 
-        #     user=None,
-        #     agent=str(abraham.id), 
-        #     session=str(session.id)
-        # )
-        # print("FP 2")
-        # print(result)
-        # print("FP 3")
-        # if "output" in result:
         event_doc.update(
             status="completed",
             session_id=session.id,
@@ -402,7 +368,6 @@ async def process_cast(event: Dict[str, Any]):
             # reply_cast=None, #result.get("output")[0],
             reply_fid=TARGET_FID,
         )
-        print("COMPLETED EVENT DOC")
         # else:
         #     event_doc.update(
         #         status="failed",
@@ -412,20 +377,15 @@ async def process_cast(event: Dict[str, Any]):
         #     )
 
     except Exception as e:
-        print("FAILED EVENT", e)
         if event_doc is not None:
-            print("FAILED EVENT DOC")
             event_doc.update(status="failed", error=str(e))
         else:
-            print("FAILED BEFORE EVENT DOC CREATION")
             logger.exception("Failed before event_doc creation: %s", e)
 
 
 async def induct_user(user: User, author: Dict[str, Any]):
     # update user metadata
     pfp = author.get("pfp_url")
-    print("PFP", pfp)
-    print("USER IMAGE", user.userImage)
     if pfp and pfp != user.userImage:
         try:
             pfp_url, _ = upload_file_from_url(pfp)
@@ -437,9 +397,6 @@ async def induct_user(user: User, author: Dict[str, Any]):
 
 async def handle_farcaster(event: Dict[str, Any]) -> Session:
     """Create a session to generate artwork with specified model."""
-    print("HANDLING FARCaster....")
-    import json
-    print(json.dumps(event, indent=4))
     cast = event["cast"]
     cast_hash = cast["hash"]
     thread_hash = cast.get("thread_hash")
@@ -452,7 +409,6 @@ async def handle_farcaster(event: Dict[str, Any]) -> Session:
     # Get or create user
     user = User.from_farcaster(author_fid, author_username)
     await induct_user(user, author)
-    print("INDUCTED USER", user.id)
 
     # get or setup session
     request = PromptSessionRequest(
@@ -471,8 +427,6 @@ async def handle_farcaster(event: Dict[str, Any]) -> Session:
     media_urls = upload_to_s3(media_urls)
     if media_urls:
         request.message.attachments = media_urls
-
-
 
     # who is actually the paying user (insuf manna)
     # session_id='None-68e75a27e96b2dffb8f3f5fd'
@@ -602,39 +556,23 @@ async def neynar_webhook(
     else:
         # Normalize and check routes
         event = normalize_cast_event(evt_raw)
-
-        print("GOT A PARENT FID")
-        print(event["author"]["fid"])
-        print("============")
-        print(TARGET_FID)
-        print(type(TARGET_FID), type(event["author"]["fid"]))
-        print("============")
-
         parent_fid = event["author"]["fid"]
         if parent_fid == TARGET_FID:
-            print("SKIP SELF")
             return JSONResponse({"status": "skip.self"}, status_code=200)
 
         if not (is_reply(event, TARGET_FID) or is_mention(event, TARGET_FID)):
-            print("SKIP, NOT RELEVANT")
             return JSONResponse({"status": "skip.not_relevant"}, status_code=200)
 
         # de-dupe
         cast_hash = event["cast"]["hash"]
-        print("GOT A CAST HASH")
-        print(cast_hash)
-        print("============")
         if FarcasterEvent.find_one({"cast_hash": cast_hash}):
-            print("DUPLICATE IGNORED")
             return JSONResponse({"status": "duplicate_ignored"}, status_code=200)
 
     # --- Offload heavy work; ACK immediately ---
-    if 1:
-        print("SPAWNING EVENT")
+    if True:
         from modal_app import process_event
         process_event.spawn(event)   # fire-and-forget on Modal infra
     else:
-        print("PROCESSING EVENT")
         await process_cast(event)
     
     return JSONResponse({"status": "accepted"}, status_code=200)
